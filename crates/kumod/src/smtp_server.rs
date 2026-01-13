@@ -693,6 +693,11 @@ pub struct EsmtpListenerParams {
 
     #[serde(default = "EsmtpListenerParams::default_max_connections")]
     max_connections: usize,
+
+    /// When true, the listener expects clients to initiate TLS immediately
+    /// upon connection (implicit TLS / SMTPS), rather than upgrading via STARTTLS.
+    #[serde(default)]
+    pub implicit_tls: bool,
 }
 
 impl EsmtpListenerParams {
@@ -985,6 +990,55 @@ impl SmtpServerSession {
 
         concrete_params.apply_generic(params.base.clone(), &my_address, &peer_address, &mut meta);
 
+        // Handle implicit TLS (SMTPS) - perform TLS handshake before any SMTP commands
+        let (socket, tls_active): (BoxedAsyncReadAndWrite, Option<TlsInformation>) =
+            if params.implicit_tls {
+                let acceptor = concrete_params.build_tls_acceptor().await?;
+                let stream = tokio::time::timeout(
+                    concrete_params.client_timeout,
+                    acceptor.accept(socket),
+                )
+                .await
+                .context("TLS handshake timeout")?
+                .context("TLS handshake failed")?;
+
+                let (_io, conn) = stream.get_ref();
+                let mut tls_info = TlsInformation::default();
+
+                tls_info.provider_name = "rustls".to_string();
+                tls_info.cipher = match conn.negotiated_cipher_suite() {
+                    Some(suite) => suite.suite().as_str().unwrap_or("UNKNOWN").to_string(),
+                    None => String::new(),
+                };
+                tls_info.protocol_version = match conn.protocol_version() {
+                    Some(version) => version.as_str().unwrap_or("UNKNOWN").to_string(),
+                    None => String::new(),
+                };
+
+                if let Some(certs) = conn.peer_certificates() {
+                    let peer_cert = &certs[0];
+                    if let Ok(cert) = X509::from_der(peer_cert.as_ref()) {
+                        tls_info.subject_name = subject_name(&cert);
+                    }
+                }
+
+                if !tls_info.cipher.is_empty() {
+                    meta.set_meta("tls_cipher", tls_info.cipher.clone());
+                }
+                if !tls_info.protocol_version.is_empty() {
+                    meta.set_meta("tls_protocol_version", tls_info.protocol_version.clone());
+                }
+                if !tls_info.subject_name.is_empty() {
+                    meta.set_meta("tls_peer_subject_name", tls_info.subject_name.clone());
+                }
+
+                meta.set_meta("reception_protocol", "ESMTPS");
+
+                (Box::new(stream), Some(tls_info))
+            } else {
+                (socket, None)
+            };
+
         let service = format!("esmtp_listener:{my_address}");
 
         let mut server = SmtpServerSession {
@@ -995,7 +1049,7 @@ impl SmtpServerSession {
             orig_peer_address: peer_address,
             my_address,
             orig_my_address: my_address,
-            tls_active: None,
+            tls_active,
             read_buffer: DebugabbleReadBuffer(Vec::with_capacity(1024)),
             params: concrete_params,
             shutdown: ShutdownSubcription::get(),
