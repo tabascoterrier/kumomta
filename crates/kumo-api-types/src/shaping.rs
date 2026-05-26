@@ -342,7 +342,7 @@ impl ShapingInner {
     }
 
     pub async fn match_rules(&self, record: &JsonLogRecord) -> anyhow::Result<Vec<Rule>> {
-        use rfc5321::ForwardPath;
+        use rfc5321::parser::ForwardPath;
         // Extract the domain from the recipient.
         let recipient = ForwardPath::try_from(
             record
@@ -1989,6 +1989,7 @@ MergedEntry {
             "::/127",
         },
         skip_hosts: {},
+        ip_lookup_strategy: Ipv4AndIpv6,
         ehlo_domain: None,
         aggressive_connection_opening: false,
         refresh_interval: 60s,
@@ -2142,6 +2143,7 @@ MergedEntry {
             "::/127",
         },
         skip_hosts: {},
+        ip_lookup_strategy: Ipv4AndIpv6,
         ehlo_domain: None,
         aggressive_connection_opening: false,
         refresh_interval: 60s,
@@ -2208,6 +2210,7 @@ MergedEntry {
                 "::/127",
             },
             skip_hosts: {},
+            ip_lookup_strategy: Ipv4AndIpv6,
             ehlo_domain: None,
             aggressive_connection_opening: false,
             refresh_interval: 60s,
@@ -2367,6 +2370,7 @@ MergedEntry {
             "::/127",
         },
         skip_hosts: {},
+        ip_lookup_strategy: Ipv4AndIpv6,
         ehlo_domain: None,
         aggressive_connection_opening: false,
         refresh_interval: 60s,

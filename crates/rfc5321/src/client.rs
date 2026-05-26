@@ -1,14 +1,11 @@
 #![allow(clippy::result_large_err)]
 use crate::client_types::*;
-use crate::{
-    AsyncReadAndWrite, BoxedAsyncReadAndWrite, Command, Domain, EsmtpParameter, ForwardPath,
-    ReversePath,
-};
-use hickory_proto::rr::rdata::tlsa::{CertUsage, Matching, Selector};
+use crate::parser::{Command, Domain, EsmtpParameter, ForwardPath, ReversePath};
+use crate::{AsyncReadAndWrite, BoxedAsyncReadAndWrite};
+use bstr::ByteSlice;
 use hickory_proto::rr::rdata::TLSA;
 use memchr::memmem::Finder;
-use openssl::pkey::PKey;
-use openssl::ssl::{DaneMatchType, DaneSelector, DaneUsage, SslOptions};
+use nom_utils::DomainString;
 use openssl::x509::{X509Ref, X509};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -23,8 +20,9 @@ use tokio::time::timeout;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tracing::Level;
 
-pub use crate::tls::TlsOptions;
-pub use {openssl, tokio_rustls};
+pub use kumo_tls_helper::TlsOptions;
+pub use openssl;
+pub use tokio_rustls;
 
 const MAX_LINE_LEN: usize = 4096;
 
@@ -88,12 +86,15 @@ impl ClientError {
             | Self::ReadError {
                 command: Some(command),
                 ..
-            } => Some(command.encode()),
+            } => Some(command.encode().to_string()),
             Self::TimeOutRequest { commands, .. } | Self::WriteError { commands, .. }
                 if !commands.is_empty() =>
             {
-                let commands: Vec<String> = commands.into_iter().map(|cmd| cmd.encode()).collect();
-                Some(commands.join(""))
+                let s: String = commands
+                    .iter()
+                    .map(|cmd| cmd.encode().to_string())
+                    .collect();
+                Some(s)
             }
             _ => None,
         }
@@ -357,13 +358,21 @@ impl SmtpClient {
                         });
                     }
                     Err(_) => {
-                        self.socket.take();
+                        // If we're using a zero timeout we're probing
+                        // for liveness, so we don't want to treat this
+                        // timeout as a fatal error that closes the
+                        // connection
+                        if timeout_duration != Duration::ZERO {
+                            self.socket.take();
+                        }
                         if let Some(tracer) = &self.tracer {
                             tracer.trace_event(SmtpClientTraceEvent::Diagnostic {
                                 level: Level::ERROR,
                                 message: format!("Read Timeout after {timeout_duration:?}"),
                             });
-                            tracer.trace_event(SmtpClientTraceEvent::Closed);
+                            if self.socket.is_none() {
+                                tracer.trace_event(SmtpClientTraceEvent::Closed);
+                            }
                         }
                         return Err(ClientError::TimeOutResponse {
                             command: cmd.cloned(),
@@ -396,6 +405,24 @@ impl SmtpClient {
                 });
             }
             self.read_buffer.extend_from_slice(&data[0..size]);
+        }
+    }
+
+    /// Check to see if there is either a unilateral response
+    /// or an error condition immediately available on the socket.
+    ///
+    /// Intended to be used after the connection has idled to see if
+    /// the peer has opted to close the connection, either gracefully
+    /// by sending what should be a 421, or abruptly by simply snipping
+    /// the connection.
+    pub async fn check_unilateral_response(&mut self) -> Result<Option<Response>, ClientError> {
+        match self.read_response(None, Duration::ZERO).await {
+            // Unilateral response was received
+            Ok(response) => Ok(Some(response)),
+            // Nothing immediately available: this should hopefully be the common case
+            Err(ClientError::TimeOutResponse { .. }) => Ok(None),
+            // An actual error
+            Err(err) => Err(err),
         }
     }
 
@@ -436,7 +463,7 @@ impl SmtpClient {
                 .map_err(ClientError::MalformedResponseLine)?;
         }
 
-        let response = response_builder.build(command.map(|cmd| cmd.encode()));
+        let response = response_builder.build(command.map(|cmd| cmd.encode().to_string()));
 
         tracing::trace!("{}: {response:?}", self.hostname);
 
@@ -502,25 +529,29 @@ impl SmtpClient {
             .sum();
 
         let mut lines: Vec<String> = vec![];
-        let mut all = String::new();
+        let mut all: Vec<u8> = vec![];
         for cmd in commands {
             let line = cmd.encode();
-            all.push_str(&line);
-            lines.push(line);
+            all.extend_from_slice(&line);
+            lines.push(line.to_string());
         }
-        tracing::trace!("send->{}: (PIPELINE) {all}", self.hostname);
+        tracing::trace!(
+            "send->{}: (PIPELINE) {}",
+            self.hostname,
+            all.as_bstr().escape_bytes()
+        );
         if self.socket.is_some() {
             if let Some(tracer) = &self.tracer {
                 // Send the lines individually to the tracer, so that we
                 // don't break --terse mode
-                for line in lines {
-                    WriteTracer::trace(tracer, &line);
+                for line in &lines {
+                    WriteTracer::trace(tracer, line);
                 }
             }
         }
         self.write_all_with_timeout(
             total_timeout,
-            all.as_bytes(),
+            &all,
             || ClientError::TimeOutRequest {
                 duration: total_timeout,
                 commands: commands.to_vec(),
@@ -538,14 +569,14 @@ impl SmtpClient {
         tracing::trace!("send->{}: {line}", self.hostname);
         if self.socket.is_some() {
             if let Some(tracer) = &self.tracer {
-                WriteTracer::trace(tracer, &line);
+                WriteTracer::trace(tracer, &line.to_string());
             }
         }
 
         let timeout_duration = command.client_timeout_request(&self.timeouts);
         self.write_all_with_timeout(
             timeout_duration,
-            line.as_bytes(),
+            &line,
             || ClientError::TimeOutRequest {
                 duration: timeout_duration,
                 commands: vec![command.clone()],
@@ -657,7 +688,11 @@ impl SmtpClient {
         ehlo_name: &str,
     ) -> Result<&HashMap<String, EsmtpCapability>, ClientError> {
         let response = self
-            .send_command(&Command::Lhlo(Domain::Name(ehlo_name.to_string())))
+            .send_command(&Command::Lhlo(Domain::DomainName(
+                ehlo_name
+                    .parse::<DomainString>()
+                    .map_err(|_| ClientError::InvalidDnsName(ehlo_name.to_string()))?,
+            )))
             .await?;
         self.ehlo_common(response)
     }
@@ -667,7 +702,11 @@ impl SmtpClient {
         ehlo_name: &str,
     ) -> Result<&HashMap<String, EsmtpCapability>, ClientError> {
         let response = self
-            .send_command(&Command::Ehlo(Domain::Name(ehlo_name.to_string())))
+            .send_command(&Command::Ehlo(Domain::DomainName(
+                ehlo_name
+                    .parse::<DomainString>()
+                    .map_err(|_| ClientError::InvalidDnsName(ehlo_name.to_string()))?,
+            )))
             .await?;
         self.ehlo_common(response)
     }
@@ -1123,100 +1162,6 @@ fn parse_response_line(line: &'_ str) -> Result<ResponseLine<'_>, ClientError> {
     }
 }
 
-impl TlsOptions {
-    pub fn build_openssl_connector(
-        &self,
-        hostname: &str,
-    ) -> Result<openssl::ssl::ConnectConfiguration, ClientError> {
-        tracing::trace!("build_openssl_connector for {hostname}");
-        let mut builder =
-            openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls_client())?;
-
-        if let (Some(cert_data), Some(key_data)) =
-            (&self.certificate_from_pem, &self.private_key_from_pem)
-        {
-            let cert = X509::from_pem(cert_data)?;
-            builder.set_certificate(&cert)?;
-
-            let key = PKey::private_key_from_pem(key_data)?;
-            builder.set_private_key(&key)?;
-
-            builder.check_private_key()?;
-        }
-
-        if let Some(list) = &self.openssl_cipher_list {
-            builder.set_cipher_list(list)?;
-        }
-
-        if let Some(suites) = &self.openssl_cipher_suites {
-            builder.set_ciphersuites(suites)?;
-        }
-
-        if let Some(options) = &self.openssl_options {
-            builder.clear_options(SslOptions::all());
-            builder.set_options(*options);
-        }
-
-        if self.insecure {
-            builder.set_verify(openssl::ssl::SslVerifyMode::NONE);
-        }
-
-        if !self.dane_tlsa.is_empty() {
-            builder.dane_enable()?;
-            builder.set_no_dane_ee_namechecks();
-        }
-
-        let connector = builder.build();
-
-        let mut config = connector.configure()?;
-
-        if !self.dane_tlsa.is_empty() {
-            config.dane_enable(hostname)?;
-            let mut any_usable = false;
-            for tlsa in &self.dane_tlsa {
-                let usable = config.dane_tlsa_add(
-                    match tlsa.cert_usage() {
-                        CertUsage::PkixTa => DaneUsage::PKIX_TA,
-                        CertUsage::PkixEe => DaneUsage::PKIX_EE,
-                        CertUsage::DaneTa => DaneUsage::DANE_TA,
-                        CertUsage::DaneEe => DaneUsage::DANE_EE,
-                        CertUsage::Unassigned(n) => DaneUsage::from_raw(n),
-                        CertUsage::Private => DaneUsage::PRIV_CERT,
-                    },
-                    match tlsa.selector() {
-                        Selector::Full => DaneSelector::CERT,
-                        Selector::Spki => DaneSelector::SPKI,
-                        Selector::Unassigned(n) => DaneSelector::from_raw(n),
-                        Selector::Private => DaneSelector::PRIV_SEL,
-                    },
-                    match tlsa.matching() {
-                        Matching::Raw => DaneMatchType::FULL,
-                        Matching::Sha256 => DaneMatchType::SHA2_256,
-                        Matching::Sha512 => DaneMatchType::SHA2_512,
-                        Matching::Unassigned(n) => DaneMatchType::from_raw(n),
-                        Matching::Private => DaneMatchType::PRIV_MATCH,
-                    },
-                    tlsa.cert_data(),
-                )?;
-
-                tracing::trace!("build_dane_connector usable={usable} {tlsa:?}");
-                if usable {
-                    any_usable = true;
-                }
-            }
-
-            if !any_usable {
-                return Err(ClientError::NoUsableDaneTlsa {
-                    hostname: hostname.to_string(),
-                    tlsa: self.dane_tlsa.clone(),
-                });
-            }
-        }
-
-        Ok(config)
-    }
-}
-
 fn apply_dot_stuffing(data: &[u8]) -> Option<Vec<u8>> {
     static LFDOT: LazyLock<Finder> = LazyLock::new(|| memchr::memmem::Finder::new("\n."));
 
@@ -1240,7 +1185,7 @@ fn apply_dot_stuffing(data: &[u8]) -> Option<Vec<u8>> {
 
 /// Extracts the object=name pairs of the subject name from a cert.
 /// eg:
-/// ```no_run
+/// ```text
 /// ["C=US", "ST=CA", "L=SanFrancisco", "O=Fort-Funston", "OU=MyOrganizationalUnit",
 /// "CN=do.havedane.net", "name=EasyRSA", "emailAddress=me@myhost.mydomain"]
 /// ```
@@ -1259,7 +1204,7 @@ pub fn subject_name(cert: &X509Ref) -> Vec<String> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::{MailPath, Mailbox};
+    use crate::parser::{EnvelopeAddress, ReversePath};
 
     #[test]
     fn test_stuffing() {
@@ -1440,13 +1385,14 @@ mod test {
                 "{:#}",
                 ClientError::TimeOutResponse {
                     command: Some(Command::MailFrom {
-                        address: ReversePath::Path(MailPath {
-                            at_domain_list: vec![],
-                            mailbox: Mailbox {
-                                local_part: "user".to_string(),
-                                domain: Domain::Name("host".to_string())
-                            }
-                        }),
+                        address: {
+                            let EnvelopeAddress::Path(p) =
+                                EnvelopeAddress::parse("user@host").unwrap()
+                            else {
+                                panic!("expected Path")
+                            };
+                            ReversePath::Path(p)
+                        },
                         parameters: vec![],
                     }),
                     duration: Duration::from_secs(10),

@@ -5,11 +5,11 @@ use crate::dkim::Signer;
 use crate::dkim::SIGN_POOL;
 pub use crate::queue_name::QueueNameComponents;
 use crate::scheduling::Scheduling;
-use crate::EnvelopeAddress;
 use anyhow::Context;
+use bstr::{BString, ByteSlice, ByteVec};
 use chrono::{DateTime, Utc};
 #[cfg(feature = "impl")]
-use config::{any_err, from_lua_value, serialize_options};
+use config::{any_err, from_lua_value, serialize_options, SerdeWrappedValue};
 use futures::FutureExt;
 use intrusive_collections::{intrusive_adapter, LinkedList, LinkedListAtomicLink};
 use kumo_chrono_helper::*;
@@ -17,6 +17,7 @@ use kumo_chrono_helper::*;
 use kumo_dkim::arc::ARC;
 use kumo_log_types::rfc3464::Report;
 use kumo_log_types::rfc5965::ARFReport;
+use kumo_prometheus::declare_metric;
 #[cfg(feature = "impl")]
 use mailparsing::{AuthenticationResult, AuthenticationResults, EncodeHeaderValue};
 use mailparsing::{
@@ -27,11 +28,12 @@ use mlua::{IntoLua, LuaSerdeExt, UserData, UserDataMethods};
 #[cfg(feature = "impl")]
 use mod_dns_resolver::get_resolver_instance;
 use parking_lot::Mutex;
-use prometheus::{Histogram, IntGauge};
+use rfc5321::parser::EnvelopeAddress;
 use serde::{Deserialize, Serialize};
 use serde_with::formats::PreferOne;
 use serde_with::{serde_as, OneOrMany};
 use spool::{get_data_spool, get_meta_spool, Spool, SpoolId};
+use std::collections::{BTreeMap, HashSet};
 use std::hash::Hash;
 use std::sync::{Arc, LazyLock, Weak};
 use std::time::{Duration, Instant};
@@ -51,45 +53,76 @@ bitflags::bitflags! {
     }
 }
 
-static MESSAGE_COUNT: LazyLock<IntGauge> = LazyLock::new(|| {
-    prometheus::register_int_gauge!("message_count", "total number of Message objects").unwrap()
-});
-static META_COUNT: LazyLock<IntGauge> = LazyLock::new(|| {
-    prometheus::register_int_gauge!(
-        "message_meta_resident_count",
-        "total number of Message objects with metadata loaded"
-    )
-    .unwrap()
-});
-static DATA_COUNT: LazyLock<IntGauge> = LazyLock::new(|| {
-    prometheus::register_int_gauge!(
-        "message_data_resident_count",
-        "total number of Message objects with body data loaded"
-    )
-    .unwrap()
-});
+declare_metric! {
+/// Total number of Message objects.
+///
+/// This encompasses all Message objects in various states, whether
+/// they are in a queue, moving between queues, being built as part
+/// of an injection, pending logging, message metadata and/or data
+/// may be either resident or offloaded to spool.
+static MESSAGE_COUNT: IntGauge("message_count");
+}
+
+declare_metric! {
+/// Total number of Message objects with metadata loaded.
+///
+/// Tracks how many messages have their `meta` data resident
+/// in memory.  This may be because they have not yet saved
+/// it, or because the message is being processed and the
+/// metadata is required for that processing.
+static META_COUNT: IntGauge("message_meta_resident_count");
+}
+
+declare_metric! {
+/// Total number of Message objects with body data loaded.
+///
+/// Tracks how many messages have their `data` resident
+/// in memory.  This may be because they have not yet saved
+/// it, or because the message is being processed and the
+/// data is either required to be in memory in order to
+/// deliver the message, or because logging or other
+/// post-injection policy is configured to operate on
+/// the message.
+static DATA_COUNT: IntGauge("message_data_resident_count");
+}
+
 static NO_DATA: LazyLock<Arc<Box<[u8]>>> = LazyLock::new(|| Arc::new(vec![].into_boxed_slice()));
-static SAVE_HIST: LazyLock<Histogram> = LazyLock::new(|| {
-    prometheus::register_histogram!(
-        "message_save_latency",
-        "how long it takes to save a message to spool"
-    )
-    .unwrap()
-});
-static LOAD_DATA_HIST: LazyLock<Histogram> = LazyLock::new(|| {
-    prometheus::register_histogram!(
-        "message_data_load_latency",
-        "how long it takes to load message data from spool"
-    )
-    .unwrap()
-});
-static LOAD_META_HIST: LazyLock<Histogram> = LazyLock::new(|| {
-    prometheus::register_histogram!(
-        "message_meta_load_latency",
-        "how long it takes to load message metadata from spool"
-    )
-    .unwrap()
-});
+
+declare_metric! {
+/// How many seconds it takes to save a message to spool.
+///
+/// This metric encompasses the elapsed time to saved
+/// either or both the `meta` and `data` portions of a
+/// message to spool.
+///
+/// High values indicate IO pressure which may be
+/// alleviated by tuning other constraints and/or
+/// [RocksDB Parameters](../../kumo/define_spool/rocks_params.md)
+static SAVE_HIST: Histogram("message_save_latency");
+}
+
+declare_metric! {
+/// How many seconds it takes to load message data from spool.
+///
+/// High values indicate IO pressure which may be caused
+/// by policy that operates on the message body post-reception.
+/// We recommend *avoiding* logging header values as that is
+/// the most common cause of this metric spiking and has
+/// the biggest impact in resolving it.
+///
+/// IO pressure may also be alleviated by tuning other constraints and/or
+/// [RocksDB Parameters](../../kumo/define_spool/rocks_params.md)
+static LOAD_DATA_HIST: Histogram("message_data_load_latency");
+}
+
+declare_metric! {
+/// How long it takes to load message metadata from spool
+///
+/// High values indicate IO pressure which may be
+/// alleviated by tuning other constraints and/or
+/// [RocksDB Parameters](../../kumo/define_spool/rocks_params.md)
+static LOAD_META_HIST: Histogram("message_meta_load_latency");
+}
 
 #[derive(Debug)]
 struct MessageInner {
@@ -974,52 +1007,16 @@ impl Message {
             .contains(MessageConformance::NON_CANONICAL_LINE_ENDINGS)
         {
             return Ok(vec![AuthenticationResult {
-                method: "dkim".to_string(),
+                method: "dkim".into(),
                 method_version: None,
-                result: "permerror".to_string(),
-                reason: Some("message has non-canonical line endings".to_string()),
+                result: "permerror".into(),
+                reason: Some("message has non-canonical line endings".into()),
                 props: Default::default(),
             }]);
         }
         let message = kumo_dkim::ParsedEmail::HeaderOnlyParse { bytes, parsed };
 
-        let from = match message.get_headers().from() {
-            Ok(Some(from)) if from.0.len() == 1 => from.0,
-            Ok(Some(from)) => {
-                return Ok(vec![AuthenticationResult {
-                    method: "dkim".to_string(),
-                    method_version: None,
-                    result: "permerror".to_string(),
-                    reason: Some(format!(
-                        "From header must have a single sender, found {}",
-                        from.len()
-                    )),
-                    props: Default::default(),
-                }]);
-            }
-            Ok(None) => {
-                return Ok(vec![AuthenticationResult {
-                    method: "dkim".to_string(),
-                    method_version: None,
-                    result: "permerror".to_string(),
-                    reason: Some("From header is missing".to_string()),
-                    props: Default::default(),
-                }]);
-            }
-            Err(err) => {
-                return Ok(vec![AuthenticationResult {
-                    method: "dkim".to_string(),
-                    method_version: None,
-                    result: "permerror".to_string(),
-                    reason: Some(format!("From header is invalid: {err:#}")),
-                    props: Default::default(),
-                }]);
-            }
-        };
-        let from_domain = &from[0].address.domain;
-
-        let results =
-            kumo_dkim::verify_email_with_resolver(from_domain, &message, &**resolver).await?;
+        let results = kumo_dkim::verify_email_with_resolver(&message, &**resolver).await?;
         Ok(results)
     }
 
@@ -1043,7 +1040,7 @@ impl Message {
         ARFReport::parse(&data)
     }
 
-    pub async fn prepend_header(&self, name: Option<&str>, value: &str) -> anyhow::Result<()> {
+    pub async fn prepend_header(&self, name: Option<&str>, value: &[u8]) -> anyhow::Result<()> {
         let data = self.data().await?;
         let mut new_data = Vec::with_capacity(size_header(name, value) + 2 + data.len());
         emit_header(&mut new_data, name, value);
@@ -1052,9 +1049,9 @@ impl Message {
         Ok(())
     }
 
-    pub async fn append_header(&self, name: Option<&str>, value: &str) -> anyhow::Result<()> {
+    pub async fn append_header(&self, name: Option<&str>, value: &[u8]) -> anyhow::Result<()> {
         let data = self.data().await?;
-        let mut new_data = Vec::with_capacity(size_header(name, value) + 2 + data.len());
+        let mut new_data = Vec::with_capacity(size_header(name, value.as_bytes()) + 2 + data.len());
         for (idx, window) in data.windows(4).enumerate() {
             if window == b"\r\n\r\n" {
                 let headers = &data[0..idx + 2];
@@ -1089,39 +1086,52 @@ impl Message {
         }
     }
 
-    pub async fn get_first_named_header_value(&self, name: &str) -> anyhow::Result<Option<String>> {
+    pub async fn get_first_named_header_value(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<BString>> {
         let data = self.data().await?;
         let HeaderParseResult { headers, .. } = Header::parse_headers(data.as_ref().as_ref())?;
 
         match headers.get_first(name) {
-            Some(hdr) => Ok(Some(hdr.as_unstructured()?)),
+            Some(hdr) => Ok(Some(
+                hdr.as_unstructured()
+                    .unwrap_or_else(|_| hdr.get_raw_value().into()),
+            )),
             None => Ok(None),
         }
     }
 
-    pub async fn get_all_named_header_values(&self, name: &str) -> anyhow::Result<Vec<String>> {
+    pub async fn get_all_named_header_values(&self, name: &str) -> anyhow::Result<Vec<BString>> {
         let data = self.data().await?;
         let HeaderParseResult { headers, .. } = Header::parse_headers(data.as_ref().as_ref())?;
 
         let mut values = vec![];
         for hdr in headers.iter_named(name) {
-            values.push(hdr.as_unstructured()?);
+            values.push(
+                hdr.as_unstructured()
+                    .unwrap_or_else(|_| hdr.get_raw_value().into()),
+            );
         }
         Ok(values)
     }
 
-    pub async fn get_all_headers(&self) -> anyhow::Result<Vec<(String, String)>> {
+    pub async fn get_all_headers(&self) -> anyhow::Result<Vec<(BString, BString)>> {
         let data = self.data().await?;
         let HeaderParseResult { headers, .. } = Header::parse_headers(data.as_ref().as_ref())?;
 
         let mut values = vec![];
         for hdr in headers.iter() {
-            values.push((hdr.get_name().to_string(), hdr.as_unstructured()?));
+            values.push((
+                hdr.get_name().into(),
+                hdr.as_unstructured()
+                    .unwrap_or_else(|_| hdr.get_raw_value().into()),
+            ));
         }
         Ok(values)
     }
 
-    pub async fn retain_headers<F: FnMut(&Header) -> bool>(
+    pub async fn retain_headers<F: FnMut(usize, &Header) -> bool>(
         &self,
         mut func: F,
     ) -> anyhow::Result<()> {
@@ -1132,8 +1142,8 @@ impl Message {
             body_offset,
             ..
         } = Header::parse_headers(data.as_ref().as_ref())?;
-        for hdr in headers.iter() {
-            let retain = (func)(hdr);
+        for (idx, hdr) in headers.iter().enumerate() {
+            let retain = (func)(idx, hdr);
             if !retain {
                 continue;
             }
@@ -1147,8 +1157,8 @@ impl Message {
 
     pub async fn remove_first_named_header(&self, name: &str) -> anyhow::Result<()> {
         let mut removed = false;
-        self.retain_headers(|hdr| {
-            if hdr.get_name().eq_ignore_ascii_case(name) && !removed {
+        self.retain_headers(|_, hdr| {
+            if hdr.get_name().eq_ignore_ascii_case(name.as_bytes()) && !removed {
                 removed = true;
                 false
             } else {
@@ -1159,37 +1169,80 @@ impl Message {
     }
 
     pub async fn import_x_headers(&self, names: Vec<String>) -> anyhow::Result<()> {
+        let specs = if names.is_empty() {
+            vec![ImportHeaderSpec {
+                name: "X-*".to_string(),
+                ..ImportHeaderSpec::default()
+            }]
+        } else {
+            names
+                .into_iter()
+                .map(|name| ImportHeaderSpec {
+                    name,
+                    ..ImportHeaderSpec::default()
+                })
+                .collect()
+        };
+        self.import_headers(specs).await
+    }
+
+    pub async fn import_headers(&self, specs: Vec<ImportHeaderSpec>) -> anyhow::Result<()> {
+        let compiled: Vec<CompiledImportHeaderSpec> = specs
+            .into_iter()
+            .map(CompiledImportHeaderSpec::compile)
+            .collect::<anyhow::Result<_>>()?;
+
         let data = self.data().await?;
         let HeaderParseResult { headers, .. } = Header::parse_headers(data.as_ref().as_ref())?;
 
-        for hdr in headers.iter() {
-            let do_import = if names.is_empty() {
-                is_x_header(hdr.get_name())
-            } else {
-                is_header_in_names_list(hdr.get_name(), &names)
-            };
-            if do_import {
-                let name = imported_header_name(hdr.get_name());
-                self.set_meta(name, hdr.as_unstructured()?).await?;
+        let mut accumulators: Vec<PerSpecAccumulator> = compiled
+            .iter()
+            .map(|s| PerSpecAccumulator::new(s.match_mode))
+            .collect();
+        let mut indices_to_remove: HashSet<usize> = HashSet::new();
+
+        for (idx, hdr) in headers.iter().enumerate() {
+            let hdr_name = hdr.get_name();
+            for (spec_idx, spec) in compiled.iter().enumerate() {
+                if spec.matches(hdr_name) {
+                    let key = spec.target_key(&hdr.get_name_lossy());
+                    let value = hdr.as_unstructured()?.to_str_lossy().to_string();
+                    accumulators[spec_idx].record(key, value);
+                    if spec.remove {
+                        indices_to_remove.insert(idx);
+                    }
+                    break;
+                }
             }
+        }
+
+        for acc in accumulators {
+            acc.write_to(self).await?;
+        }
+
+        if !indices_to_remove.is_empty() {
+            self.retain_headers(|idx, _| !indices_to_remove.contains(&idx))
+                .await?;
         }
 
         Ok(())
     }
 
     pub async fn remove_x_headers(&self, names: Vec<String>) -> anyhow::Result<()> {
-        self.retain_headers(|hdr| {
+        self.retain_headers(|_, hdr| {
             if names.is_empty() {
                 !is_x_header(hdr.get_name())
             } else {
-                !is_header_in_names_list(hdr.get_name(), &names)
+                !names
+                    .iter()
+                    .any(|n| hdr.get_name().eq_ignore_ascii_case(n.as_bytes()))
             }
         })
         .await
     }
 
     pub async fn remove_all_named_headers(&self, name: &str) -> anyhow::Result<()> {
-        self.retain_headers(|hdr| !hdr.get_name().eq_ignore_ascii_case(name))
+        self.retain_headers(|_, hdr| !hdr.get_name().eq_ignore_ascii_case(name.as_bytes()))
             .await
     }
 
@@ -1201,7 +1254,7 @@ impl Message {
         } else {
             signer.sign(&data)?
         };
-        self.prepend_header(None, &header).await?;
+        self.prepend_header(None, header.as_bytes()).await?;
         Ok(())
     }
 
@@ -1211,7 +1264,7 @@ impl Message {
         remove: bool,
     ) -> anyhow::Result<Option<Scheduling>> {
         if let Some(value) = self.get_first_named_header_value(header_name).await? {
-            let sched: Scheduling = serde_json::from_str(&value).with_context(|| {
+            let sched: Scheduling = serde_json::from_slice(&value).with_context(|| {
                 format!("{value} from header {header_name} is not a valid Scheduling header")
             })?;
             let result = self.set_scheduling(Some(sched)).await?;
@@ -1233,13 +1286,13 @@ impl Message {
         if let Some(p) = parts.text_part.and_then(|p| msg.resolve_ptr_mut(p)) {
             match p.body()? {
                 DecodedBody::Text(text) => {
-                    let mut text = text.as_str().to_string();
+                    let mut text = text.as_bytes().to_vec();
                     text.push_str("\r\n");
                     text.push_str(content);
-                    p.replace_text_body("text/plain", &text)?;
+                    p.replace_text_body("text/plain", &*text)?;
 
-                    let new_data = msg.to_message_string();
-                    self.assign_data(new_data.into_bytes());
+                    let new_data = msg.to_message_bytes();
+                    self.assign_data(new_data);
                     Ok(true)
                 }
                 DecodedBody::Binary(_) => {
@@ -1258,7 +1311,7 @@ impl Message {
         if let Some(p) = parts.html_part.and_then(|p| msg.resolve_ptr_mut(p)) {
             match p.body()? {
                 DecodedBody::Text(text) => {
-                    let mut text = text.as_str().to_string();
+                    let mut text = text.as_bytes().to_vec();
 
                     match text.rfind("</body>").or_else(|| text.rfind("</BODY>")) {
                         Some(idx) => {
@@ -1272,10 +1325,10 @@ impl Message {
                         }
                     }
 
-                    p.replace_text_body("text/html", &text)?;
+                    p.replace_text_body("text/html", &*text)?;
 
-                    let new_data = msg.to_message_string();
-                    self.assign_data(new_data.into_bytes());
+                    let new_data = msg.to_message_bytes();
+                    self.assign_data(new_data);
                     Ok(true)
                 }
                 DecodedBody::Binary(_) => {
@@ -1316,21 +1369,12 @@ impl Message {
         let opt_msg = msg.check_fix_conformance(check, fix, settings)?;
 
         if let Some(msg) = opt_msg {
-            let new_data = msg.to_message_string();
-            self.assign_data(new_data.into_bytes());
+            let new_data = msg.to_message_bytes();
+            self.assign_data(new_data);
         }
 
         Ok(())
     }
-}
-
-fn is_header_in_names_list(hdr_name: &str, names: &[String]) -> bool {
-    for name in names {
-        if hdr_name.eq_ignore_ascii_case(name) {
-            return true;
-        }
-    }
-    false
 }
 
 fn imported_header_name(name: &str) -> String {
@@ -1342,21 +1386,242 @@ fn imported_header_name(name: &str) -> String {
         .collect()
 }
 
-fn is_x_header(name: &str) -> bool {
-    name.starts_with("X-") || name.starts_with("x-")
+fn is_x_header(name: &[u8]) -> bool {
+    name.starts_with_str("X-") || name.starts_with_str("x-")
 }
 
-fn size_header(name: Option<&str>, value: &str) -> usize {
+#[derive(Default, Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchMode {
+    First,
+    #[default]
+    Last,
+    All,
+}
+
+#[derive(Default, Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NameTransform {
+    #[default]
+    SnakeCase,
+    KebabCase,
+    CamelCase,
+    PascalCase,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportHeaderSpec {
+    pub name: String,
+    #[serde(default, rename = "match")]
+    pub match_mode: MatchMode,
+    #[serde(default)]
+    pub transform: NameTransform,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub remove: bool,
+}
+
+impl Default for ImportHeaderSpec {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            match_mode: MatchMode::default(),
+            transform: NameTransform::default(),
+            target: None,
+            remove: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum HeaderPattern {
+    /// Case-insensitive exact match.
+    Exact(String),
+    /// Matches any header whose name (case-insensitively) starts with the
+    /// given prefix. Built from a pattern like `X-*`.
+    Prefix(String),
+}
+
+#[derive(Debug, Clone)]
+struct CompiledImportHeaderSpec {
+    pattern: HeaderPattern,
+    match_mode: MatchMode,
+    transform: NameTransform,
+    target: Option<String>,
+    remove: bool,
+}
+
+impl CompiledImportHeaderSpec {
+    fn compile(spec: ImportHeaderSpec) -> anyhow::Result<Self> {
+        let pattern = compile_header_pattern(&spec.name)?;
+        if spec.target.is_some() && matches!(pattern, HeaderPattern::Prefix(_)) {
+            anyhow::bail!(
+                "import_headers: `target` cannot be used with wildcard pattern {:?}",
+                spec.name
+            );
+        }
+        Ok(Self {
+            pattern,
+            match_mode: spec.match_mode,
+            transform: spec.transform,
+            target: spec.target,
+            remove: spec.remove,
+        })
+    }
+
+    fn matches(&self, hdr_name: &[u8]) -> bool {
+        match &self.pattern {
+            HeaderPattern::Exact(s) => hdr_name.eq_ignore_ascii_case(s.as_bytes()),
+            HeaderPattern::Prefix(p) => {
+                hdr_name.len() >= p.len() && hdr_name[..p.len()].eq_ignore_ascii_case(p.as_bytes())
+            }
+        }
+    }
+
+    fn target_key(&self, matched_name: &str) -> String {
+        if let Some(target) = &self.target {
+            return target.clone();
+        }
+        apply_name_transform(matched_name, self.transform)
+    }
+}
+
+fn compile_header_pattern(pat: &str) -> anyhow::Result<HeaderPattern> {
+    if pat.is_empty() {
+        anyhow::bail!("import_headers: header name pattern must not be empty");
+    }
+    let star_count = pat.chars().filter(|c| *c == '*').count();
+    if star_count == 0 {
+        return Ok(HeaderPattern::Exact(pat.to_string()));
+    }
+    let Some(prefix) = pat.strip_suffix('*') else {
+        anyhow::bail!(
+            "import_headers: only a single trailing `*` is supported in pattern {:?}",
+            pat
+        );
+    };
+    if star_count > 1 {
+        anyhow::bail!(
+            "import_headers: only a single trailing `*` is supported in pattern {:?}",
+            pat
+        );
+    }
+    if prefix.is_empty() {
+        anyhow::bail!("import_headers: bare `*` patterns are not supported");
+    }
+    Ok(HeaderPattern::Prefix(prefix.to_string()))
+}
+
+fn apply_name_transform(name: &str, transform: NameTransform) -> String {
+    match transform {
+        NameTransform::SnakeCase => imported_header_name(name),
+        NameTransform::KebabCase => name
+            .split('-')
+            .map(|p| p.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join("-"),
+        NameTransform::CamelCase => name
+            .split('-')
+            .enumerate()
+            .map(|(i, p)| {
+                if i == 0 {
+                    p.to_ascii_lowercase()
+                } else {
+                    titlecase_ascii(p)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        NameTransform::PascalCase => name
+            .split('-')
+            .map(titlecase_ascii)
+            .collect::<Vec<_>>()
+            .join(""),
+    }
+}
+
+fn titlecase_ascii(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => {
+            let mut out = String::with_capacity(s.len());
+            out.push(first.to_ascii_uppercase());
+            for c in chars {
+                out.push(c.to_ascii_lowercase());
+            }
+            out
+        }
+    }
+}
+
+enum AccValue {
+    Str(String),
+    Arr(Vec<String>),
+}
+
+struct PerSpecAccumulator {
+    mode: MatchMode,
+    by_key: BTreeMap<String, AccValue>,
+}
+
+impl PerSpecAccumulator {
+    fn new(mode: MatchMode) -> Self {
+        Self {
+            mode,
+            by_key: BTreeMap::new(),
+        }
+    }
+
+    fn record(&mut self, key: String, value: String) {
+        match self.mode {
+            MatchMode::First => {
+                self.by_key.entry(key).or_insert(AccValue::Str(value));
+            }
+            MatchMode::Last => {
+                self.by_key.insert(key, AccValue::Str(value));
+            }
+            MatchMode::All => {
+                let entry = self
+                    .by_key
+                    .entry(key)
+                    .or_insert_with(|| AccValue::Arr(Vec::new()));
+                if let AccValue::Arr(v) = entry {
+                    v.push(value);
+                }
+            }
+        }
+    }
+
+    async fn write_to(self, msg: &Message) -> anyhow::Result<()> {
+        for (key, value) in self.by_key {
+            match value {
+                AccValue::Str(s) => msg.set_meta(key, s).await?,
+                AccValue::Arr(arr) => {
+                    let json = serde_json::Value::Array(
+                        arr.into_iter().map(serde_json::Value::String).collect(),
+                    );
+                    msg.set_meta(key, json).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn size_header(name: Option<&str>, value: &[u8]) -> usize {
     name.map(|name| name.len() + 2).unwrap_or(0) + value.len()
 }
 
-fn emit_header(dest: &mut Vec<u8>, name: Option<&str>, value: &str) {
+fn emit_header(dest: &mut Vec<u8>, name: Option<&str>, value: &[u8]) {
     if let Some(name) = name {
         dest.extend_from_slice(name.as_bytes());
         dest.extend_from_slice(b": ");
     }
-    dest.extend_from_slice(value.as_bytes());
-    if !value.ends_with("\r\n") {
+    dest.extend_from_slice(value);
+    if !value.ends_with_str("\r\n") {
         dest.extend_from_slice(b"\r\n");
     }
 }
@@ -1387,7 +1652,7 @@ impl UserData for Message {
 
         methods.add_async_method("parse_mime", |_lua, this, _: ()| async move {
             let data = this.data().await.map_err(any_err)?;
-            let owned_data = String::from_utf8_lossy(data.as_ref().as_ref()).to_string();
+            let owned_data = BString::new(data.as_ref().to_vec());
             let part = MimePart::parse(owned_data).map_err(any_err)?;
             Ok(mod_mimepart::PartRef::new(part))
         });
@@ -1407,6 +1672,9 @@ impl UserData for Message {
 
         methods.add_method("num_attempts", move |_, this, _: ()| {
             Ok(this.get_num_attempts())
+        });
+        methods.add_method("increment_num_attempts", move |_, this, _: ()| {
+            Ok(this.increment_num_attempts())
         });
 
         methods.add_async_method("queue_name", move |_, this, _: ()| async move {
@@ -1491,17 +1759,20 @@ impl UserData for Message {
 
         methods.add_async_method(
             "add_authentication_results",
-            |lua, this, (serv_id, results): (String, mlua::Value)| async move {
+            |lua, this, (serv_id, results): (mlua::String, mlua::Value)| async move {
                 let results: Vec<AuthenticationResult> = lua.from_value(results)?;
                 let results = AuthenticationResults {
-                    serv_id,
+                    serv_id: serv_id.as_bytes().as_ref().into(),
                     version: None,
                     results,
                 };
 
-                this.prepend_header(Some("Authentication-Results"), &results.encode_value())
-                    .await
-                    .map_err(any_err)?;
+                this.prepend_header(
+                    Some("Authentication-Results"),
+                    results.encode_value().as_bytes(),
+                )
+                .await
+                .map_err(any_err)?;
 
                 Ok(())
             },
@@ -1523,7 +1794,7 @@ impl UserData for Message {
              this,
              (signer, serv_id, auth_res, opt_resolver_name): (
                 Signer,
-                String,
+                mlua::String,
                 mlua::Value,
                 Option<String>,
             )| async move {
@@ -1531,7 +1802,7 @@ impl UserData for Message {
                 this.arc_seal(
                     signer,
                     AuthenticationResults {
-                        serv_id,
+                        serv_id: serv_id.as_bytes().as_ref().into(),
                         version: None,
                         results,
                     },
@@ -1561,7 +1832,7 @@ impl UserData for Message {
                         .await
                         .map_err(any_err)?;
                 } else {
-                    this.prepend_header(Some(&name), &value)
+                    this.prepend_header(Some(&name), value.as_bytes())
                         .await
                         .map_err(any_err)?;
                 }
@@ -1578,7 +1849,7 @@ impl UserData for Message {
                         .await
                         .map_err(any_err)?;
                 } else {
-                    this.append_header(Some(&name), &value)
+                    this.append_header(Some(&name), value.as_bytes())
                         .await
                         .map_err(any_err)?;
                 }
@@ -1618,7 +1889,7 @@ impl UserData for Message {
                 .map_err(any_err)?
                 .into_iter()
                 .map(|(name, value)| vec![name, value])
-                .collect::<Vec<Vec<String>>>())
+                .collect::<Vec<Vec<BString>>>())
         });
         methods.add_async_method(
             "import_x_headers",
@@ -1626,6 +1897,12 @@ impl UserData for Message {
                 this.import_x_headers(names.unwrap_or_default())
                     .await
                     .map_err(any_err)
+            },
+        );
+        methods.add_async_method(
+            "import_headers",
+            |_, this, specs: SerdeWrappedValue<Vec<ImportHeaderSpec>>| async move {
+                this.import_headers(specs.0).await.map_err(any_err)
             },
         );
 
@@ -1807,6 +2084,143 @@ pub(crate) mod test {
     }
 
     #[tokio::test]
+    async fn import_headers_wildcard_remove() {
+        let msg = new_msg_body(X_HDR_CONTENT);
+
+        msg.import_headers(vec![ImportHeaderSpec {
+            name: "X-*".to_string(),
+            remove: true,
+            ..ImportHeaderSpec::default()
+        }])
+        .await
+        .unwrap();
+        k9::assert_equal!(
+            msg.get_meta_obj().await.unwrap(),
+            json!({
+                "x_hello": "there",
+                "x_header": "value",
+            })
+        );
+        k9::assert_equal!(
+            data_as_string(&msg),
+            "Subject: Hello\r\nFrom :Someone\r\n\r\nBody"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_headers_match_modes() {
+        let body =
+            "Received: from a\r\nReceived: from b\r\nReceived: from c\r\nSubject: hi\r\n\r\nBody";
+        for (mode, expected) in [
+            (MatchMode::First, json!("from a")),
+            (MatchMode::Last, json!("from c")),
+            (MatchMode::All, json!(["from a", "from b", "from c"])),
+        ] {
+            let msg = new_msg_body(body);
+            msg.import_headers(vec![ImportHeaderSpec {
+                name: "Received".to_string(),
+                match_mode: mode,
+                ..ImportHeaderSpec::default()
+            }])
+            .await
+            .unwrap();
+            k9::assert_equal!(
+                msg.get_meta_obj().await.unwrap(),
+                json!({ "received": expected })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn import_headers_no_match_skips_meta() {
+        let msg = new_msg_body(X_HDR_CONTENT);
+        msg.import_headers(vec![ImportHeaderSpec {
+            name: "Nonexistent".to_string(),
+            match_mode: MatchMode::All,
+            ..ImportHeaderSpec::default()
+        }])
+        .await
+        .unwrap();
+        k9::assert_equal!(msg.get_meta_obj().await.unwrap(), json!({}));
+    }
+
+    #[tokio::test]
+    async fn import_headers_specific_before_wildcard() {
+        let body = "X-Campaign-Id: 42\r\nX-Mailer: foo\r\n\r\nBody";
+        let msg = new_msg_body(body);
+        msg.import_headers(vec![
+            ImportHeaderSpec {
+                name: "X-Campaign-Id".to_string(),
+                target: Some("campaign".to_string()),
+                ..ImportHeaderSpec::default()
+            },
+            ImportHeaderSpec {
+                name: "X-*".to_string(),
+                ..ImportHeaderSpec::default()
+            },
+        ])
+        .await
+        .unwrap();
+        k9::assert_equal!(
+            msg.get_meta_obj().await.unwrap(),
+            json!({
+                "campaign": "42",
+                "x_mailer": "foo",
+            })
+        );
+    }
+
+    #[test]
+    fn name_transforms() {
+        let n = "X-Campaign-Id";
+        k9::assert_equal!(
+            apply_name_transform(n, NameTransform::SnakeCase),
+            "x_campaign_id"
+        );
+        k9::assert_equal!(
+            apply_name_transform(n, NameTransform::KebabCase),
+            "x-campaign-id"
+        );
+        k9::assert_equal!(
+            apply_name_transform(n, NameTransform::CamelCase),
+            "xCampaignId"
+        );
+        k9::assert_equal!(
+            apply_name_transform(n, NameTransform::PascalCase),
+            "XCampaignId"
+        );
+    }
+
+    #[test]
+    fn pattern_compile_rejects_bad_patterns() {
+        compile_header_pattern("").unwrap_err();
+        compile_header_pattern("*").unwrap_err();
+        compile_header_pattern("*-Id").unwrap_err();
+        compile_header_pattern("X-*-Id").unwrap_err();
+        compile_header_pattern("X-**").unwrap_err();
+        assert!(matches!(
+            compile_header_pattern("Subject").unwrap(),
+            HeaderPattern::Exact(_)
+        ));
+        assert!(matches!(
+            compile_header_pattern("X-*").unwrap(),
+            HeaderPattern::Prefix(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn import_headers_target_with_wildcard_rejected() {
+        let msg = new_msg_body(X_HDR_CONTENT);
+        msg.import_headers(vec![ImportHeaderSpec {
+            name: "X-*".to_string(),
+            target: Some("oops".to_string()),
+            ..ImportHeaderSpec::default()
+        }])
+        .await
+        .unwrap_err();
+    }
+
+    #[tokio::test]
     async fn remove_all_x_headers() {
         let msg = new_msg_body(X_HDR_CONTENT);
 
@@ -1821,7 +2235,7 @@ pub(crate) mod test {
     async fn prepend_header_2_params() {
         let msg = new_msg_body(X_HDR_CONTENT);
 
-        msg.prepend_header(Some("Date"), "Today").await.unwrap();
+        msg.prepend_header(Some("Date"), b"Today").await.unwrap();
         k9::assert_equal!(
             data_as_string(&msg),
             "Date: Today\r\nX-Hello: there\r\nX-Header: value\r\nSubject: Hello\r\nFrom :Someone\r\n\r\nBody"
@@ -1832,7 +2246,7 @@ pub(crate) mod test {
     async fn prepend_header_1_params() {
         let msg = new_msg_body(X_HDR_CONTENT);
 
-        msg.prepend_header(None, "Date: Today").await.unwrap();
+        msg.prepend_header(None, b"Date: Today").await.unwrap();
         k9::assert_equal!(
             data_as_string(&msg),
             "Date: Today\r\nX-Hello: there\r\nX-Header: value\r\nSubject: Hello\r\nFrom :Someone\r\n\r\nBody"
@@ -1843,7 +2257,7 @@ pub(crate) mod test {
     async fn append_header_2_params() {
         let msg = new_msg_body(X_HDR_CONTENT);
 
-        msg.append_header(Some("Date"), "Today").await.unwrap();
+        msg.append_header(Some("Date"), b"Today").await.unwrap();
         k9::assert_equal!(
             data_as_string(&msg),
             "X-Hello: there\r\nX-Header: value\r\nSubject: Hello\r\nFrom :Someone\r\nDate: Today\r\n\r\nBody"
@@ -1854,7 +2268,7 @@ pub(crate) mod test {
     async fn append_header_1_params() {
         let msg = new_msg_body(X_HDR_CONTENT);
 
-        msg.append_header(None, "Date: Today").await.unwrap();
+        msg.append_header(None, b"Date: Today").await.unwrap();
         k9::assert_equal!(
             data_as_string(&msg),
             "X-Hello: there\r\nX-Header: value\r\nSubject: Hello\r\nFrom :Someone\r\nDate: Today\r\n\r\nBody"

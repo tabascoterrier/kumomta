@@ -86,7 +86,7 @@ impl<'a> MessageBuilder<'a> {
                 "multipart/alternative",
                 vec![t?, amp?, h?],
                 if self.stable_content {
-                    Some("ma-boundary")
+                    Some(b"ma-boundary")
                 } else {
                     None
                 },
@@ -97,7 +97,7 @@ impl<'a> MessageBuilder<'a> {
                 "multipart/alternative",
                 vec![first?, second?],
                 if self.stable_content {
-                    Some("ma-boundary")
+                    Some(b"ma-boundary")
                 } else {
                     None
                 },
@@ -124,7 +124,7 @@ impl<'a> MessageBuilder<'a> {
                 "multipart/related",
                 parts,
                 if self.stable_content {
-                    Some("mr-boundary")
+                    Some(b"mr-boundary")
                 } else {
                     None
                 },
@@ -141,7 +141,7 @@ impl<'a> MessageBuilder<'a> {
                 "multipart/mixed",
                 parts,
                 if self.stable_content {
-                    Some("mm-boundary")
+                    Some(b"mm-boundary")
                 } else {
                     None
                 },
@@ -191,6 +191,7 @@ impl<'a> std::ops::DerefMut for MessageBuilder<'a> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use bstr::BString;
 
     #[test]
     fn basic() {
@@ -201,7 +202,7 @@ mod test {
         b.text_html("<b>this is html 🚀</b>");
         let msg = b.build().unwrap();
         k9::snapshot!(
-            msg.to_message_string(),
+            BString::from(msg.to_message_bytes()),
             r#"
 Content-Type: multipart/alternative;\r
 \tboundary="ma-boundary"\r
@@ -251,7 +252,7 @@ Hello World in AMP!
         );
         let msg = b.build().unwrap();
         k9::snapshot!(
-            msg.to_message_string(),
+            BString::from(msg.to_message_bytes()),
             r#"
 Content-Type: multipart/alternative;\r
 \tboundary="ma-boundary"\r
@@ -304,14 +305,14 @@ Content-Transfer-Encoding: quoted-printable\r
             b"hello",
             Some(&AttachmentOptions {
                 content_id: None,
-                file_name: Some("日本語の添付.txt".to_string()),
+                file_name: Some("日本語の添付.txt".into()),
                 inline: false,
             }),
         )
         .unwrap();
         let msg = b.build().unwrap();
         k9::snapshot!(
-            msg.to_message_string(),
+            BString::from(msg.to_message_bytes()),
             r#"
 Content-Type: multipart/mixed;\r
 \tboundary="mm-boundary"\r

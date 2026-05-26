@@ -1,9 +1,10 @@
 #![cfg(test)]
 use crate::tsa::{TsaArgs, TsaDaemon};
 use crate::webhook::WebHookServer;
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use futures::stream::FusedStream;
 use futures::{SinkExt, StreamExt};
+use kumo_api_client::KumoApiClient;
 use kumo_api_types::{TraceSmtpV1Event, TraceSmtpV1Request};
 use kumo_log_types::*;
 use kumo_server_common::acct::AcctLogRecord;
@@ -11,9 +12,8 @@ use maildir::{MailEntry, Maildir};
 use mailparsing::MessageBuilder;
 use nix::unistd::{Uid, User};
 use parking_lot::Mutex;
-use rfc5321::{
-    BatchSendSuccess, ForwardPath, Response, ReversePath, SmtpClient, SmtpClientTimeouts,
-};
+use rfc5321::parser::{ForwardPath, ReversePath};
+use rfc5321::{BatchSendSuccess, Response, SmtpClient, SmtpClientTimeouts};
 use sqlite::{Connection, State};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -109,8 +109,8 @@ impl MailGenParams<'_> {
 
         Ok(client
             .send_mail(
-                ReversePath::try_from(sender).unwrap(),
-                ForwardPath::try_from(recip).unwrap(),
+                ReversePath::try_from(sender).map_err(|err| anyhow!("invalid sender: {err}"))?,
+                ForwardPath::try_from(recip).map_err(|err| anyhow!("invalid recipient: {err}"))?,
                 &body,
             )
             .await?)
@@ -157,7 +157,7 @@ impl MailGenParams<'_> {
         message.prepend("X-Test1", "Test1");
         message.prepend("X-Another", "Another");
         message.set_stable_content(true);
-        Ok(message.build()?.to_message_string())
+        Ok(String::from_utf8(message.build()?.to_message_bytes())?)
     }
 }
 
@@ -225,6 +225,8 @@ impl DaemonWithMaildir {
             .context("spawn_maildir")?;
         let smtp = sink.listener("smtp");
         env.push(("KUMOD_SMTP_SINK_PORT".to_string(), smtp.port().to_string()));
+        let http = sink.listener("http");
+        env.push(("KUMOD_HTTP_SINK_PORT".to_string(), http.port().to_string()));
 
         let source = KumoDaemon::spawn(KumoArgs {
             policy_file: options.policy_file,
@@ -606,6 +608,12 @@ impl KumoDaemon {
             Some(addr) => *addr,
             None => panic!("listener service {service} is not defined. Did it fail to start?"),
         }
+    }
+
+    pub fn api_client(&self) -> KumoApiClient {
+        let endpoint = format!("http://{}", self.listener("http"));
+        let url = kumo_api_client::Url::parse(&endpoint).unwrap();
+        KumoApiClient::new(url)
     }
 
     pub async fn smtp_client(&self, host: &str) -> anyhow::Result<SmtpClient> {

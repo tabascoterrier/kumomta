@@ -6,7 +6,7 @@ use crate::logging::disposition::{log_disposition, LogDisposition, RecordType};
 use crate::logging::rejection::{log_rejection, LogRejection};
 use crate::metrics_helper::smtp_rejected_for_service;
 use crate::queue::{DeliveryProto, IncrementAttempts, InsertReason, QueueConfig, QueueManager};
-use crate::ready_queue::{Dispatcher, QueueDispatcher};
+use crate::ready_queue::{AttemptConnectionDisposition, Dispatcher, QueueDispatcher};
 use crate::spool::SpoolManager;
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
@@ -19,26 +19,26 @@ use data_encoding::BASE64;
 use data_loader::KeySource;
 use derive_where::derive_where;
 use kumo_log_types::ResolvedAddress;
-use kumo_prometheus::AtomicCounter;
+use kumo_prometheus::prometheus::HistogramTimer;
+use kumo_prometheus::{declare_metric, AtomicCounter};
 use kumo_server_common::acct::{log_authn, AuthnAuditRecord};
 use kumo_server_common::authn_authz::{AuthInfo, Identity, IdentityContext};
 use kumo_server_common::http_server::auth::AuthKindResult;
-use kumo_server_lifecycle::{Activity, ShutdownSubcription};
+use kumo_server_lifecycle::{Activity, ShutdownSubcription, ShuttingDownError};
 use kumo_server_runtime::{spawn, Runtime};
 use lruttl::declare_cache;
 use mailparsing::ConformanceDisposition;
 use memchr::memmem::Finder;
-use message::{EnvelopeAddress, Message};
+use message::Message;
 use mlua::prelude::LuaUserData;
 use mlua::{FromLuaMulti, IntoLuaMulti, LuaSerdeExt, UserData, UserDataMethods};
 use openssl::x509::X509;
 use parking_lot::FairMutex as Mutex;
 use ppp::{HeaderResult, PartialResult};
-use prometheus::{Histogram, HistogramTimer};
-use rfc5321::{
-    subject_name, AsyncReadAndWrite, BoxedAsyncReadAndWrite, Command, Response, TlsInformation,
-    XClientParameter,
+use rfc5321::parser::{
+    Command, EnvelopeAddress, MaybePartialCommand, PartialReason, XClientParameter,
 };
+use rfc5321::{subject_name, AsyncReadAndWrite, BoxedAsyncReadAndWrite, Response, TlsInformation};
 use rustls::ServerConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -118,27 +118,21 @@ static SMTP_SERVER_AUTH_PLAIN: Single(
 }
 
 static CRLF: LazyLock<Finder> = LazyLock::new(|| Finder::new("\r\n"));
-static TXN_LATENCY: LazyLock<Histogram> = LazyLock::new(|| {
-    prometheus::register_histogram!(
-        "smtpsrv_transaction_duration",
-        "how long an incoming SMTP transaction takes",
-    )
-    .unwrap()
-});
-static READ_DATA_LATENCY: LazyLock<Histogram> = LazyLock::new(|| {
-    prometheus::register_histogram!(
-        "smtpsrv_read_data_duration",
-        "how long it takes to receive the DATA portion",
-    )
-    .unwrap()
-});
-static PROCESS_DATA_LATENCY: LazyLock<Histogram> = LazyLock::new(|| {
-    prometheus::register_histogram!(
-        "smtpsrv_process_data_duration",
-        "how long it takes to process the DATA portion and enqueue",
-    )
-    .unwrap()
-});
+
+declare_metric! {
+/// how long an incoming SMTP transaction takes
+static TXN_LATENCY: Histogram("smtpsrv_transaction_duration");
+}
+
+declare_metric! {
+/// how long it takes to receive the DATA portion
+static READ_DATA_LATENCY: Histogram("smtpsrv_read_data_duration");
+}
+
+declare_metric! {
+/// how long it takes to process the DATA portion and enqueue
+static PROCESS_DATA_LATENCY: Histogram("smtpsrv_process_data_duration");
+}
 
 #[derive(Debug, Hash, PartialEq, Eq)]
 struct DomainAndListener {
@@ -382,7 +376,7 @@ impl TraceHeaders {
 
         let value = BASE64.encode(serde_json::to_string(&object)?.as_bytes());
         message
-            .prepend_header(Some(&self.header_name), &value)
+            .prepend_header(Some(&self.header_name), value.as_bytes())
             .await?;
 
         Ok(())
@@ -790,23 +784,6 @@ impl EsmtpListenerParams {
             }
         })?;
         Ok(())
-    }
-}
-
-#[derive(Error, Debug, Clone)]
-#[error("shutting down")]
-pub struct ShuttingDownError;
-
-impl ShuttingDownError {
-    pub fn is_shutting_down(err: &anyhow::Error) -> bool {
-        if err
-            .root_cause()
-            .downcast_ref::<ShuttingDownError>()
-            .is_some()
-        {
-            return true;
-        }
-        format!("{err:#}").contains("shutting down")
     }
 }
 
@@ -1770,7 +1747,20 @@ impl SmtpServerSession {
                     )
                     .await?;
                 }
-                Ok(Command::Quit) => {
+                Ok(MaybePartialCommand::Partial { reason, .. }) => {
+                    let msg = match reason {
+                        PartialReason::InvalidRecipientAddress => {
+                            "5.1.3 Invalid recipient address syntax"
+                        }
+                        PartialReason::InvalidSenderAddress => {
+                            "5.1.7 Bad sender's mailbox address syntax"
+                        }
+                        PartialReason::Syntax => "Syntax error in command or arguments",
+                    };
+                    self.write_response(501, msg, Some(line), RejectDisconnect::If421)
+                        .await?;
+                }
+                Ok(MaybePartialCommand::Full(Command::Quit)) => {
                     self.write_response(
                         221,
                         "So long, and thanks for all the fish!",
@@ -1780,7 +1770,7 @@ impl SmtpServerSession {
                     .await?;
                     return Ok(());
                 }
-                Ok(Command::StartTls) => {
+                Ok(MaybePartialCommand::Full(Command::StartTls)) => {
                     if self.tls_active.is_some() {
                         self.write_response(
                             501,
@@ -1849,17 +1839,17 @@ impl SmtpServerSession {
                     };
                     self.socket.replace(socket);
                 }
-                Ok(Command::Auth {
+                Ok(MaybePartialCommand::Full(Command::Auth {
                     sasl_mech,
                     initial_response,
-                }) => {
+                })) => {
                     if self.process_auth(line, sasl_mech, initial_response).await?
                         == CommandDisposition::Terminate
                     {
                         return Ok(());
                     }
                 }
-                Ok(Command::Ehlo(domain)) => {
+                Ok(MaybePartialCommand::Full(Command::Ehlo(domain))) => {
                     let domain = domain.to_string();
 
                     let mut extensions =
@@ -1900,7 +1890,7 @@ impl SmtpServerSession {
                     self.meta.set_meta("ehlo_domain", domain.clone());
                     self.said_hello.replace(domain);
                 }
-                Ok(Command::Helo(domain)) => {
+                Ok(MaybePartialCommand::Full(Command::Helo(domain))) => {
                     let domain = domain.to_string();
 
                     if let Err(rej) = self
@@ -1924,10 +1914,10 @@ impl SmtpServerSession {
                     self.meta.set_meta("ehlo_domain", domain.clone());
                     self.said_hello.replace(domain);
                 }
-                Ok(Command::MailFrom {
+                Ok(MaybePartialCommand::Full(Command::MailFrom {
                     address,
                     parameters: _,
-                }) => {
+                })) => {
                     if self.state.is_some() {
                         self.write_response(
                             503,
@@ -1938,7 +1928,19 @@ impl SmtpServerSession {
                         .await?;
                         continue;
                     }
-                    let address = EnvelopeAddress::parse(&address.to_string())?;
+                    let address = match EnvelopeAddress::try_from(address) {
+                        Ok(address) => address,
+                        Err(err) => {
+                            self.write_response(
+                                501,
+                                format!("5.1.7 Invalid sender address syntax: {err}"),
+                                Some(line),
+                                RejectDisconnect::If421,
+                            )
+                            .await?;
+                            continue;
+                        }
+                    };
                     if let Err(rej) = self
                         .call_callback::<(), _, _>(
                             "smtp_server_mail_from",
@@ -1964,10 +1966,10 @@ impl SmtpServerSession {
                     )
                     .await?;
                 }
-                Ok(Command::RcptTo {
+                Ok(MaybePartialCommand::Full(Command::RcptTo {
                     address,
                     parameters: _,
-                }) => {
+                })) => {
                     if self.state.is_none() {
                         self.write_response(
                             503,
@@ -1978,7 +1980,7 @@ impl SmtpServerSession {
                         .await?;
                         continue;
                     }
-                    let address = EnvelopeAddress::parse(&address.to_string())?;
+                    let address = EnvelopeAddress::from(address);
 
                     let sender = self.state.as_ref().unwrap().sender.clone();
                     let relay_disposition = self.check_relaying(&sender, &address).await?;
@@ -2065,7 +2067,7 @@ impl SmtpServerSession {
                         .recipients
                         .push(address);
                 }
-                Ok(Command::Data) => {
+                Ok(MaybePartialCommand::Full(Command::Data)) => {
                     if self.state.is_none() {
                         self.write_response(
                             503,
@@ -2150,12 +2152,12 @@ impl SmtpServerSession {
                     let _process_data_timer = PROCESS_DATA_LATENCY.start_timer();
                     Box::pin(self.process_data(data, &activity)).await?;
                 }
-                Ok(Command::Rset) => {
+                Ok(MaybePartialCommand::Full(Command::Rset)) => {
                     self.state.take();
                     self.write_response(250, "Reset state", None, RejectDisconnect::If421)
                         .await?;
                 }
-                Ok(Command::Noop(_)) => {
+                Ok(MaybePartialCommand::Full(Command::Noop(_))) => {
                     self.write_response(
                         250,
                         "the goggles do nothing",
@@ -2164,10 +2166,16 @@ impl SmtpServerSession {
                     )
                     .await?;
                 }
-                Ok(Command::XClient(params)) => {
+                Ok(MaybePartialCommand::Full(Command::XClient(params))) => {
                     self.process_xclient(&params).await?;
                 }
-                Ok(Command::Vrfy(_) | Command::Expn(_) | Command::Help(_) | Command::Lhlo(_)) => {
+                Ok(MaybePartialCommand::Full(
+                    Command::Vrfy(_)
+                    | Command::Expn(_)
+                    | Command::Help(_)
+                    | Command::Lhlo(_)
+                    | Command::Unknown(_),
+                )) => {
                     self.write_response(
                         502,
                         format!("5.5.1 Command unimplemented"),
@@ -2176,7 +2184,7 @@ impl SmtpServerSession {
                     )
                     .await?;
                 }
-                Ok(Command::DataDot) => unreachable!(),
+                Ok(MaybePartialCommand::Full(Command::DataDot)) => unreachable!(),
             }
         }
     }
@@ -2365,14 +2373,11 @@ impl SmtpServerSession {
         let mut dest_port: Option<u16> = None;
 
         for p in params {
-            let name = &p.name;
-            let value = &p.value;
-
-            if name.eq_ignore_ascii_case("ADDR") {
-                let Ok(ip) = value.parse::<IpAddr>() else {
+            if p.is_name("ADDR") {
+                let Ok(ip) = p.parse::<IpAddr>() else {
                     self.write_response(
                         501,
-                        format!("ADDR {value} is invalid"),
+                        format!("ADDR {} is invalid", p.value),
                         None,
                         RejectDisconnect::If421,
                     )
@@ -2380,11 +2385,11 @@ impl SmtpServerSession {
                     return Ok(());
                 };
                 addr.replace(ip);
-            } else if name.eq_ignore_ascii_case("PORT") {
-                let Ok(v) = value.parse::<u16>() else {
+            } else if p.is_name("PORT") {
+                let Ok(v) = p.parse::<u16>() else {
                     self.write_response(
                         501,
-                        format!("PORT {value} is invalid"),
+                        format!("PORT {} is invalid", p.value),
                         None,
                         RejectDisconnect::If421,
                     )
@@ -2392,11 +2397,11 @@ impl SmtpServerSession {
                     return Ok(());
                 };
                 port.replace(v);
-            } else if name.eq_ignore_ascii_case("DESTADDR") {
-                let Ok(ip) = value.parse::<IpAddr>() else {
+            } else if p.is_name("DESTADDR") {
+                let Ok(ip) = p.parse::<IpAddr>() else {
                     self.write_response(
                         501,
-                        format!("ADDR {value} is invalid"),
+                        format!("DESTADDR {} is invalid", p.value),
                         None,
                         RejectDisconnect::If421,
                     )
@@ -2404,11 +2409,11 @@ impl SmtpServerSession {
                     return Ok(());
                 };
                 dest_addr.replace(ip);
-            } else if name.eq_ignore_ascii_case("DESTPORT") {
-                let Ok(v) = value.parse::<u16>() else {
+            } else if p.is_name("DESTPORT") {
+                let Ok(v) = p.parse::<u16>() else {
                     self.write_response(
                         501,
-                        format!("PORT {value} is invalid"),
+                        format!("DESTPORT {} is invalid", p.value),
                         None,
                         RejectDisconnect::If421,
                     )
@@ -2419,7 +2424,7 @@ impl SmtpServerSession {
             } else {
                 self.write_response(
                     501,
-                    format!("parameter {name} is not supported"),
+                    format!("parameter {} is not supported", p.name),
                     None,
                     RejectDisconnect::If421,
                 )
@@ -3492,12 +3497,17 @@ impl QueueDispatcher for DeferredSmtpInjectionDispatcher {
         }
     }
 
-    async fn attempt_connection(&mut self, dispatcher: &mut Dispatcher) -> anyhow::Result<()> {
+    async fn attempt_connection(
+        &mut self,
+        dispatcher: &mut Dispatcher,
+    ) -> anyhow::Result<AttemptConnectionDisposition> {
         if self.connection.is_none() {
             self.connection
                 .replace(dispatcher.metrics.wrap_connection(()));
+            Ok(AttemptConnectionDisposition::ConnectedNew)
+        } else {
+            Ok(AttemptConnectionDisposition::ReusedExisting)
         }
-        Ok(())
     }
 
     async fn have_more_connection_candidates(&mut self, _dispatcher: &mut Dispatcher) -> bool {
