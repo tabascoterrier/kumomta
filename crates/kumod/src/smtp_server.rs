@@ -971,13 +971,22 @@ impl SmtpServerSession {
         let (socket, tls_active): (BoxedAsyncReadAndWrite, Option<TlsInformation>) =
             if params.implicit_tls {
                 let acceptor = concrete_params.build_tls_acceptor().await?;
-                let stream = tokio::time::timeout(
+                let stream = match tokio::time::timeout(
                     concrete_params.client_timeout,
                     acceptor.accept(socket),
                 )
                 .await
-                .context("TLS handshake timeout")?
-                .context("TLS handshake failed")?;
+                {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(err)) => {
+                        tracing::debug!("TLS handshake failed: {err:#}");
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        tracing::debug!("TLS handshake timeout");
+                        return Ok(());
+                    }
+                };
 
                 let (_io, conn) = stream.get_ref();
                 let mut tls_info = TlsInformation::default();
