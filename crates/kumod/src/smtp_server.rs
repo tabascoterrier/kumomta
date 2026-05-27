@@ -1022,7 +1022,6 @@ impl SmtpServerSession {
 
                 let (_io, conn) = stream.get_ref();
                 let tls_info = extract_tls_info(conn, &mut meta);
-                meta.set_meta("reception_protocol", "ESMTPS");
 
                 (Box::new(stream), Some(tls_info))
             } else {
