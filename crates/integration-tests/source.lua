@@ -44,6 +44,7 @@ kumo.on('init', function()
       },
     },
     batch_handling = BATCH_HANDLING,
+    implicit_tls = (os.getenv 'KUMOD_SOURCE_IMPLICIT_TLS' and true) or false,
   }
 
   kumo.start_http_listener {
