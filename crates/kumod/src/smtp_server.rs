@@ -942,6 +942,38 @@ impl RelayDisposition {
     }
 }
 
+fn extract_tls_info(
+    conn: &rustls::ServerConnection,
+    meta: &mut ConnectionMetaData,
+) -> TlsInformation {
+    let mut tls_info = TlsInformation::default();
+    tls_info.provider_name = "rustls".to_string();
+    tls_info.cipher = match conn.negotiated_cipher_suite() {
+        Some(suite) => suite.suite().as_str().unwrap_or("UNKNOWN").to_string(),
+        None => String::new(),
+    };
+    tls_info.protocol_version = match conn.protocol_version() {
+        Some(version) => version.as_str().unwrap_or("UNKNOWN").to_string(),
+        None => String::new(),
+    };
+    if let Some(certs) = conn.peer_certificates() {
+        let peer_cert = &certs[0];
+        if let Ok(cert) = X509::from_der(peer_cert.as_ref()) {
+            tls_info.subject_name = subject_name(&cert);
+        }
+    }
+    if !tls_info.cipher.is_empty() {
+        meta.set_meta("tls_cipher", tls_info.cipher.clone());
+    }
+    if !tls_info.protocol_version.is_empty() {
+        meta.set_meta("tls_protocol_version", tls_info.protocol_version.clone());
+    }
+    if !tls_info.subject_name.is_empty() {
+        meta.set_meta("tls_peer_subject_name", tls_info.subject_name.clone());
+    }
+    tls_info
+}
+
 impl SmtpServerSession {
     #[instrument(skip(params, my_address, peer_address))]
     pub async fn run<T>(
@@ -989,35 +1021,7 @@ impl SmtpServerSession {
                 };
 
                 let (_io, conn) = stream.get_ref();
-                let mut tls_info = TlsInformation::default();
-
-                tls_info.provider_name = "rustls".to_string();
-                tls_info.cipher = match conn.negotiated_cipher_suite() {
-                    Some(suite) => suite.suite().as_str().unwrap_or("UNKNOWN").to_string(),
-                    None => String::new(),
-                };
-                tls_info.protocol_version = match conn.protocol_version() {
-                    Some(version) => version.as_str().unwrap_or("UNKNOWN").to_string(),
-                    None => String::new(),
-                };
-
-                if let Some(certs) = conn.peer_certificates() {
-                    let peer_cert = &certs[0];
-                    if let Ok(cert) = X509::from_der(peer_cert.as_ref()) {
-                        tls_info.subject_name = subject_name(&cert);
-                    }
-                }
-
-                if !tls_info.cipher.is_empty() {
-                    meta.set_meta("tls_cipher", tls_info.cipher.clone());
-                }
-                if !tls_info.protocol_version.is_empty() {
-                    meta.set_meta("tls_protocol_version", tls_info.protocol_version.clone());
-                }
-                if !tls_info.subject_name.is_empty() {
-                    meta.set_meta("tls_peer_subject_name", tls_info.subject_name.clone());
-                }
-
+                let tls_info = extract_tls_info(conn, &mut meta);
                 meta.set_meta("reception_protocol", "ESMTPS");
 
                 (Box::new(stream), Some(tls_info))
@@ -1800,43 +1804,7 @@ impl SmtpServerSession {
                     {
                         Ok(stream) => {
                             let (_io, conn) = stream.get_ref();
-                            let mut tls_info = TlsInformation::default();
-
-                            tls_info.provider_name = "rustls".to_string();
-                            tls_info.cipher = match conn.negotiated_cipher_suite() {
-                                Some(suite) => {
-                                    suite.suite().as_str().unwrap_or("UNKNOWN").to_string()
-                                }
-                                None => String::new(),
-                            };
-                            tls_info.protocol_version = match conn.protocol_version() {
-                                Some(version) => version.as_str().unwrap_or("UNKNOWN").to_string(),
-                                None => String::new(),
-                            };
-
-                            if let Some(certs) = conn.peer_certificates() {
-                                let peer_cert = &certs[0];
-                                if let Ok(cert) = X509::from_der(peer_cert.as_ref()) {
-                                    tls_info.subject_name = subject_name(&cert);
-                                }
-                            }
-
-                            if !tls_info.cipher.is_empty() {
-                                self.meta.set_meta("tls_cipher", tls_info.cipher.clone());
-                            }
-                            if !tls_info.protocol_version.is_empty() {
-                                self.meta.set_meta(
-                                    "tls_protocol_version",
-                                    tls_info.protocol_version.clone(),
-                                );
-                            }
-                            if !tls_info.subject_name.is_empty() {
-                                self.meta.set_meta(
-                                    "tls_peer_subject_name",
-                                    tls_info.subject_name.clone(),
-                                );
-                            }
-
+                            let tls_info = extract_tls_info(conn, &mut self.meta);
                             self.tls_active = Some(tls_info);
 
                             Box::new(stream)
