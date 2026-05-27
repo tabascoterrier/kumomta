@@ -967,14 +967,6 @@ impl SmtpServerSession {
 
         concrete_params.apply_generic(params.base.clone(), &my_address, &peer_address, &mut meta);
 
-        connection_gauge().inc();
-
-        SmtpServerTraceManager::submit(|| SmtpServerTraceEvent {
-            conn_meta: meta.clone_inner(),
-            payload: SmtpServerTraceEventPayload::Connected,
-            when: Utc::now(),
-        });
-
         // Handle implicit TLS (SMTPS) - perform TLS handshake before any SMTP commands
         let (socket, tls_active): (BoxedAsyncReadAndWrite, Option<TlsInformation>) =
             if params.implicit_tls {
@@ -988,22 +980,10 @@ impl SmtpServerSession {
                     Ok(Ok(stream)) => stream,
                     Ok(Err(err)) => {
                         tracing::debug!("TLS handshake failed: {err:#}");
-                        connection_gauge().dec();
-                        SmtpServerTraceManager::submit(|| SmtpServerTraceEvent {
-                            conn_meta: meta.clone_inner(),
-                            payload: SmtpServerTraceEventPayload::Closed,
-                            when: Utc::now(),
-                        });
                         return Ok(());
                     }
                     Err(_) => {
                         tracing::debug!("TLS handshake timeout");
-                        connection_gauge().dec();
-                        SmtpServerTraceManager::submit(|| SmtpServerTraceEvent {
-                            conn_meta: meta.clone_inner(),
-                            payload: SmtpServerTraceEventPayload::Closed,
-                            when: Utc::now(),
-                        });
                         return Ok(());
                     }
                 };
@@ -1044,6 +1024,14 @@ impl SmtpServerSession {
             } else {
                 (socket, None)
             };
+
+        connection_gauge().inc();
+
+        SmtpServerTraceManager::submit(|| SmtpServerTraceEvent {
+            conn_meta: meta.clone_inner(),
+            payload: SmtpServerTraceEventPayload::Connected,
+            when: Utc::now(),
+        });
 
         let service = format!("esmtp_listener:{my_address}");
 
