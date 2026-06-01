@@ -974,6 +974,168 @@ fn extract_tls_info(
     tls_info
 }
 
+/// Extract the source and destination [`SocketAddr`]s from a parsed PROXY protocol header,
+/// along with the number of bytes the header occupies on the wire. Shared by the
+/// STARTTLS/plain path ([`SmtpServerSession::process_proxy_protocol`]) and the implicit-TLS
+/// path ([`read_proxy_protocol_header`]).
+fn parse_proxy_addresses(
+    header: HeaderResult,
+) -> anyhow::Result<(Option<SocketAddr>, Option<SocketAddr>, usize)> {
+    let mut addr: Option<SocketAddr> = None;
+    let mut dest_addr: Option<SocketAddr> = None;
+    let consumed_bytes;
+    match header {
+        HeaderResult::V1(Ok(header)) => {
+            consumed_bytes = header.header.len();
+            match header.addresses {
+                ppp::v1::Addresses::Tcp4(addresses) => {
+                    addr.replace((addresses.source_address, addresses.source_port).into());
+                    dest_addr
+                        .replace((addresses.destination_address, addresses.destination_port).into());
+                }
+                ppp::v1::Addresses::Tcp6(addresses) => {
+                    addr.replace((addresses.source_address, addresses.source_port).into());
+                    dest_addr
+                        .replace((addresses.destination_address, addresses.destination_port).into());
+                }
+                ppp::v1::Addresses::Unknown => {}
+            }
+        }
+        HeaderResult::V2(Ok(header)) => {
+            consumed_bytes = header.header.len();
+            match header.addresses {
+                ppp::v2::Addresses::IPv4(addresses) => {
+                    addr.replace((addresses.source_address, addresses.source_port).into());
+                    dest_addr
+                        .replace((addresses.destination_address, addresses.destination_port).into());
+                }
+                ppp::v2::Addresses::IPv6(addresses) => {
+                    addr.replace((addresses.source_address, addresses.source_port).into());
+                    dest_addr
+                        .replace((addresses.destination_address, addresses.destination_port).into());
+                }
+                ppp::v2::Addresses::Unspecified | ppp::v2::Addresses::Unix(_) => {}
+            }
+        }
+        HeaderResult::V1(Err(error)) => {
+            anyhow::bail!("proxy protocol v1 parsing error: {error}")
+        }
+        HeaderResult::V2(Err(error)) => {
+            anyhow::bail!("proxy protocol v2 parsing error: {error}")
+        }
+    }
+    Ok((addr, dest_addr, consumed_bytes))
+}
+
+/// The 12-byte signature that introduces a PROXY protocol v2 (binary) header.
+const PROXY_V2_SIGNATURE: [u8; 12] = *b"\r\n\r\n\0\r\nQUIT\n";
+
+/// Determine whether `buf` holds a complete PROXY protocol header by following the protocol's
+/// own framing, so we know exactly where the header ends and never consume any of the bytes
+/// that follow it.
+///
+/// We can't drive this off `ppp`'s incremental parser: it reports a header that is merely
+/// truncated mid-field (e.g. a v1 header whose port digits haven't arrived yet) as a hard
+/// parse error rather than as "needs more data", so feeding it one byte at a time stops early
+/// on a spurious error.
+///
+/// Returns `Ok(true)` once a full header is buffered, `Ok(false)` if more bytes are needed, and
+/// an error if `buf` cannot be the start of a valid header (e.g. a client that connected
+/// without sending one).
+fn proxy_header_is_complete(buf: &[u8]) -> anyhow::Result<bool> {
+    // A v1 header ("PROXY ...") starts with 'P'; the v2 binary signature starts with '\r'.
+    if buf.first() == Some(&b'P') {
+        // v1 is a single CRLF-terminated line of at most 107 bytes.
+        if buf.ends_with(b"\r\n") {
+            return Ok(true);
+        }
+        anyhow::ensure!(buf.len() < 107, "PROXY protocol v1 header is too long");
+        Ok(false)
+    } else {
+        // v2 is a 16-byte fixed header (the 12-byte signature, a version/command byte, a
+        // family/protocol byte, and a 2-byte payload length) followed by that many payload bytes.
+        let prefix = buf.len().min(PROXY_V2_SIGNATURE.len());
+        anyhow::ensure!(
+            buf[..prefix] == PROXY_V2_SIGNATURE[..prefix],
+            "not a valid PROXY protocol header"
+        );
+        if buf.len() < 16 {
+            return Ok(false);
+        }
+        let payload_len = u16::from_be_bytes([buf[14], buf[15]]) as usize;
+        Ok(buf.len() >= 16 + payload_len)
+    }
+}
+
+/// Read a PROXY protocol header directly from the raw socket, stopping the instant the header
+/// is complete so we don't consume any bytes past its end. That matters for implicit TLS
+/// (SMTPS): the TLS acceptor reads the ClientHello straight from this same socket and knows
+/// nothing about any buffer we might over-read into, so anything we read past the PROXY header
+/// would be lost.
+async fn read_proxy_protocol_header(
+    socket: &mut BoxedAsyncReadAndWrite,
+    timeout: Duration,
+) -> anyhow::Result<(Option<SocketAddr>, Option<SocketAddr>)> {
+    let (addr, dest_addr, _consumed) = tokio::time::timeout(timeout, async {
+        let mut buf = Vec::with_capacity(108);
+        let mut byte = [0u8; 1];
+        while !proxy_header_is_complete(&buf)? {
+            let n = socket
+                .read(&mut byte)
+                .await
+                .context("error reading proxy protocol header")?;
+            if n == 0 {
+                anyhow::bail!("peer disconnected while reading proxy protocol header");
+            }
+            buf.push(byte[0]);
+        }
+        parse_proxy_addresses(HeaderResult::parse(&buf))
+    })
+    .await
+    .context("timeout reading proxy protocol header")??;
+
+    Ok((addr, dest_addr))
+}
+
+/// Fully resolve the listener parameters for a freshly accepted connection using the supplied
+/// addresses: start from the configured `base` (which applies any matching `peer`/`via`
+/// blocks) and then apply the overrides returned by the `smtp_server_get_dynamic_parameters`
+/// event.
+///
+/// This is the same resolution that the STARTTLS/plain path performs in process() /
+/// [`SmtpServerSession::re_evaluate_listener_parameters`], factored out so it can run before
+/// the [`SmtpServerSession`] exists. That lets an implicit-TLS (SMTPS) listener build its TLS
+/// acceptor from fully-resolved parameters (per-source / per-destination certificates, client
+/// CAs, hostname) using the real client and destination addresses.
+///
+/// A rejection returned by the event is intentionally ignored here: there is no SMTP channel
+/// to report it on before the TLS handshake. process() re-runs the event once the session is
+/// up and will reject there with a proper SMTP response.
+async fn resolve_listener_params(
+    base: &GenericEsmtpListenerParams,
+    my_address: &SocketAddr,
+    peer_address: &SocketAddr,
+    meta: &mut ConnectionMetaData,
+) -> anyhow::Result<ConcreteEsmtpListenerParams> {
+    let mut params = ConcreteEsmtpListenerParams::default();
+    params.apply_generic(base.clone(), my_address, peer_address, meta);
+
+    let sig = CallbackSignature::<(String, ConnectionMetaData), GenericEsmtpListenerParams>::new(
+        "smtp_server_get_dynamic_parameters",
+    );
+    let mut config = load_config().await?;
+    let result = config
+        .async_call_callback(&sig, (my_address.to_string(), meta.clone()))
+        .await;
+    config.put();
+    match result {
+        Ok(generic) => params.apply_generic(generic, my_address, peer_address, meta),
+        Err(err) if RejectError::from_anyhow(&err).is_none() => return Err(err),
+        Err(_reject) => {}
+    }
+    Ok(params)
+}
+
 impl SmtpServerSession {
     #[instrument(skip(params, my_address, peer_address))]
     pub async fn run<T>(
@@ -985,7 +1147,7 @@ impl SmtpServerSession {
     where
         T: AsyncReadAndWrite + Debug + Send + 'static,
     {
-        let socket: BoxedAsyncReadAndWrite = Box::new(socket);
+        let mut socket: BoxedAsyncReadAndWrite = Box::new(socket);
         let mut meta = ConnectionMetaData::new();
         meta.set_meta("reception_protocol", "ESMTP");
         meta.set_meta("received_via", my_address.to_string());
@@ -998,6 +1160,68 @@ impl SmtpServerSession {
         meta.set_meta("hostname", concrete_params.hostname.to_string());
 
         concrete_params.apply_generic(params.base.clone(), &my_address, &peer_address, &mut meta);
+
+        // Preserve the original socket-level addresses; `peer_address`/`my_address` may be
+        // rewritten below if an implicit-TLS listener also speaks the PROXY protocol.
+        let orig_peer_address = peer_address;
+        let orig_my_address = my_address;
+        let mut peer_address = peer_address;
+        let mut my_address = my_address;
+
+        // An implicit-TLS (SMTPS) listener performs its TLS handshake before any SMTP, so every
+        // listener parameter that feeds the TLS acceptor (per-peer/via and dynamic certificates,
+        // client CAs, hostname) must be fully resolved *here*, before the handshake below. The
+        // STARTTLS/plain path gets this for free: it resolves parameters in process() (PROXY
+        // header, then smtp_server_get_dynamic_parameters) before the STARTTLS command builds its
+        // acceptor.
+        if params.implicit_tls {
+            // 1. If the listener also requires PROXY protocol, the cleartext PROXY header arrives
+            //    ahead of the client's ClientHello. Consume it from the raw socket now (without
+            //    over-reading into the ClientHello) and adopt the real addresses it advertises.
+            if concrete_params.require_proxy_protocol {
+                match read_proxy_protocol_header(&mut socket, concrete_params.client_timeout).await {
+                    Ok((src, dst)) => {
+                        if let Some(src) = src {
+                            meta.set_meta("orig_received_from", peer_address.to_string());
+                            meta.set_meta("received_from", src.to_string());
+                            peer_address = src;
+                            meta.auth_info
+                                .lock()
+                                .set_peer_address(Some(peer_address.ip()));
+                        }
+                        if let Some(dst) = dst {
+                            meta.set_meta("orig_received_via", my_address.to_string());
+                            meta.set_meta("received_via", dst.to_string());
+                            my_address = dst;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!("Error processing PROXY protocol: {err:#}");
+                        return Ok(());
+                    }
+                }
+            }
+
+            // 2. Re-resolve the listener parameters using the real (post-PROXY) addresses so that
+            //    per-source / per-destination TLS certificates select correctly. The initial
+            //    apply_generic above used the original socket addresses, which differ when proxied.
+            match resolve_listener_params(&params.base, &my_address, &peer_address, &mut meta).await
+            {
+                Ok(resolved) => concrete_params = resolved,
+                Err(err) => {
+                    // Proceed with the parameters resolved so far; process() re-resolves below and
+                    // will surface the error with a proper SMTP response once TLS is established.
+                    tracing::error!(
+                        "error resolving listener parameters before implicit TLS handshake: {err:#}"
+                    );
+                }
+            }
+
+            // 3. The PROXY header (if any) has already been consumed from the raw socket; clear
+            //    the flag so the SMTP phase in process() doesn't try to read a second PROXY header
+            //    off the (now decrypted) stream, which would mis-parse the client's EHLO.
+            concrete_params.require_proxy_protocol = false;
+        }
 
         // Handle implicit TLS (SMTPS) - perform TLS handshake before any SMTP commands
         let (socket, tls_active): (BoxedAsyncReadAndWrite, Option<TlsInformation>) =
@@ -1036,16 +1260,16 @@ impl SmtpServerSession {
             when: Utc::now(),
         });
 
-        let service = format!("esmtp_listener:{my_address}");
+        let service = format!("esmtp_listener:{orig_my_address}");
 
         let mut server = SmtpServerSession {
             socket: Some(socket),
             state: None,
             said_hello: None,
             peer_address,
-            orig_peer_address: peer_address,
+            orig_peer_address,
             my_address,
-            orig_my_address: my_address,
+            orig_my_address,
             tls_active,
             read_buffer: DebugabbleReadBuffer(Vec::with_capacity(1024)),
             params: concrete_params,
@@ -2222,55 +2446,7 @@ impl SmtpServerSession {
             }
         };
 
-        let mut addr: Option<SocketAddr> = None;
-        let mut dest_addr: Option<SocketAddr> = None;
-        let consumed_bytes;
-        match header {
-            HeaderResult::V1(Ok(header)) => {
-                consumed_bytes = header.header.len();
-                let addresses = header.addresses;
-                match addresses {
-                    ppp::v1::Addresses::Tcp4(addresses) => {
-                        addr.replace((addresses.source_address, addresses.source_port).into());
-                        dest_addr.replace(
-                            (addresses.destination_address, addresses.destination_port).into(),
-                        );
-                    }
-                    ppp::v1::Addresses::Tcp6(addresses) => {
-                        addr.replace((addresses.source_address, addresses.source_port).into());
-                        dest_addr.replace(
-                            (addresses.destination_address, addresses.destination_port).into(),
-                        );
-                    }
-                    ppp::v1::Addresses::Unknown => {}
-                }
-            }
-            HeaderResult::V2(Ok(header)) => {
-                consumed_bytes = header.header.len();
-                let addresses = header.addresses;
-                match addresses {
-                    ppp::v2::Addresses::IPv4(addresses) => {
-                        addr.replace((addresses.source_address, addresses.source_port).into());
-                        dest_addr.replace(
-                            (addresses.destination_address, addresses.destination_port).into(),
-                        );
-                    }
-                    ppp::v2::Addresses::IPv6(addresses) => {
-                        addr.replace((addresses.source_address, addresses.source_port).into());
-                        dest_addr.replace(
-                            (addresses.destination_address, addresses.destination_port).into(),
-                        );
-                    }
-                    ppp::v2::Addresses::Unspecified | ppp::v2::Addresses::Unix(_) => {}
-                }
-            }
-            HeaderResult::V1(Err(error)) => {
-                anyhow::bail!("proxy protocol v1 parsing error: {error}")
-            }
-            HeaderResult::V2(Err(error)) => {
-                anyhow::bail!("proxy protocol v2 parsing error: {error}")
-            }
-        }
+        let (addr, dest_addr, consumed_bytes) = parse_proxy_addresses(header)?;
         self.read_buffer.drain(0..consumed_bytes);
 
         if addr.is_some() {

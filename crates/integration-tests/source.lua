@@ -45,6 +45,9 @@ kumo.on('init', function()
     },
     batch_handling = BATCH_HANDLING,
     implicit_tls = (os.getenv 'KUMOD_SOURCE_IMPLICIT_TLS' and true) or false,
+    require_proxy_protocol = (
+      os.getenv 'KUMOD_SOURCE_REQUIRE_PROXY_PROTOCOL' and true
+    ) or false,
   }
 
   kumo.start_http_listener {
