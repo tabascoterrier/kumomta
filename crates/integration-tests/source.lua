@@ -32,6 +32,7 @@ kumo.on('init', function()
   kumo.start_esmtp_listener {
     listen = '127.0.0.1:0',
     relay_hosts = relay_hosts,
+    max_connections_per_ip = os.getenv 'KUMOD_MAX_CONNECTIONS_PER_IP',
     deferred_queue = (DEFERRED_SMTP_SERVER_MSG_INJECT and true) or false,
     peer = {
       ['127.0.0.1'] = {

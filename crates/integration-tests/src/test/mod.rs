@@ -30,6 +30,7 @@ mod maildir_batch;
 mod maildir_batch_452;
 mod maildir_batch_max_per_batch;
 mod maildir_batch_split_hook;
+mod max_connections_per_ip;
 mod max_line_length;
 mod mx_list_refresh;
 mod nats;

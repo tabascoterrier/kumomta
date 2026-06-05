@@ -50,6 +50,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use throttle::limit::{LimitLease, LimitSpecWithDuration};
+use throttle::LimitSpec;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::timeout_at;
@@ -418,6 +420,9 @@ pub struct ConcreteEsmtpListenerParams {
     pub data_processing_timeout: Duration,
     pub batch_handling: BatchHandling,
 
+    max_connections_per_ip: Option<LimitSpec>,
+    max_connections_per_ip_duration: Duration,
+
     max_messages_per_connection: usize,
     max_recipients_per_message: usize,
 
@@ -499,6 +504,12 @@ impl ConcreteEsmtpListenerParams {
         if let Some(data_processing_timeout) = base.data_processing_timeout {
             self.data_processing_timeout = data_processing_timeout;
         }
+        if let Some(max_connections_per_ip) = base.max_connections_per_ip {
+            self.max_connections_per_ip = Some(max_connections_per_ip);
+        }
+        if let Some(max_connections_per_ip_duration) = base.max_connections_per_ip_duration {
+            self.max_connections_per_ip_duration = max_connections_per_ip_duration;
+        }
         if let Some(max_messages_per_connection) = base.max_messages_per_connection {
             self.max_messages_per_connection = max_messages_per_connection;
         }
@@ -579,6 +590,8 @@ impl Default for ConcreteEsmtpListenerParams {
             trace_headers: TraceHeaders::default(),
             client_timeout: Duration::from_secs(60),
             data_processing_timeout: Duration::from_secs(300),
+            max_connections_per_ip: None,
+            max_connections_per_ip_duration: Duration::from_secs(15 * 60),
             max_messages_per_connection: 10_000,
             max_recipients_per_message: 1024,
             max_message_size: 20 * 1024 * 1024,
@@ -636,6 +649,12 @@ pub struct GenericEsmtpListenerParams {
 
     #[serde(default, with = "duration_serde")]
     pub data_processing_timeout: Option<Duration>,
+
+    #[serde(default)]
+    pub max_connections_per_ip: Option<LimitSpec>,
+
+    #[serde(default, with = "duration_serde")]
+    pub max_connections_per_ip_duration: Option<Duration>,
 
     #[serde(default)]
     pub peer: Option<Arc<CidrMap<Box<GenericEsmtpListenerParams>>>>,
@@ -912,6 +931,7 @@ pub struct SmtpServerSession {
     session_id: Uuid,
     domains: HashMap<String, Option<EsmtpDomain>>,
     config_params: EsmtpListenerParams,
+    per_ip_lease: Option<LimitLease>,
 }
 
 #[derive_where(Debug)]
@@ -987,6 +1007,7 @@ impl SmtpServerSession {
             session_id: Uuid::new_v4(),
             domains: HashMap::new(),
             config_params: params,
+            per_ip_lease: None,
         };
 
         connection_gauge().inc();
@@ -1632,6 +1653,51 @@ impl SmtpServerSession {
             self.write_response(rej.code, rej.message, None, rej.disconnect)
                 .await?;
             return Ok(());
+        }
+
+        // Enforce the per-IP concurrent connection limit, keyed on the (PROXY-resolved) peer address.
+        // Reserve the slot for a fixed duration rather than attempting to periodically renew a lease.
+        // A session that stays open longer than that duration may have its slot freed early, but that's
+        // an acceptable trade for a DoS mitigation, senders that hold a connection open for many messages
+        // are likely legitimate. Leases are freed on connection close.
+        if let Some(spec) = self.params.max_connections_per_ip {
+            let limit = LimitSpecWithDuration {
+                spec,
+                duration: self.params.max_connections_per_ip_duration,
+            };
+            // Key on the configured `listen` string so that redis-backed
+            // enforcement is genuinely cluster-wide.
+            let key = format!(
+                "kumomta.esmtp_listener.{}.conn_per_ip.{}",
+                self.config_params.listen,
+                self.peer_address.ip()
+            );
+            match limit.acquire_lease(&key, Instant::now()).await {
+                Ok(lease) => {
+                    self.per_ip_lease = Some(lease);
+                }
+                Err(throttle::Error::TooManyLeases(_)) => {
+                    connection_denied_counter().inc();
+                    self.write_response(
+                        421,
+                        format!(
+                            "4.3.2 {} too many concurrent connections from your address. Try later",
+                            self.params.hostname
+                        ),
+                        None,
+                        RejectDisconnect::If421,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Err(err) => {
+                    // Fail open on backend errors (e.g. Redis unavailable) rather
+                    // than locking out all inbound mail.
+                    tracing::warn!(
+                        "max_connections_per_ip: failed to acquire lease for {key}: {err:#}"
+                    );
+                }
+            }
         }
 
         self.write_response(
