@@ -1155,16 +1155,17 @@ async fn call_callback_sig_with_meta<
 /// blocks) and then apply the overrides returned by the `smtp_server_get_dynamic_parameters`
 /// event.
 ///
-/// This is the same resolution that the STARTTLS/plain path performs in process() /
-/// [`SmtpServerSession::re_evaluate_listener_parameters`], factored out so it can run before
-/// the [`SmtpServerSession`] exists. That lets an implicit-TLS (SMTPS) listener build its TLS
-/// acceptor from fully-resolved parameters (per-source / per-destination certificates, client
-/// CAs, hostname) using the real client and destination addresses.
+/// This is the shared core of [`SmtpServerSession::re_evaluate_listener_parameters`]; it is a
+/// free function so that an implicit-TLS (SMTPS) listener can also run it before the
+/// [`SmtpServerSession`] exists, building its TLS acceptor from fully-resolved parameters
+/// (per-source / per-destination certificates, client CAs, hostname) using the real client
+/// and destination addresses.
 ///
-/// A rejection returned by the event cannot be reported yet (there is no SMTP channel before
-/// the TLS handshake), so it is returned alongside the resolved parameters; the caller stashes
-/// it on the session and process() delivers it once the encrypted channel is up. This is the
-/// one and only invocation of the event for an implicit-TLS session.
+/// A rejection returned by the event is not delivered here; it is returned alongside the
+/// resolved parameters for the caller to handle. re_evaluate_listener_parameters writes it
+/// as an SMTP response immediately, while the implicit-TLS path has no channel to report it
+/// on before the handshake, so it stashes the rejection on the session and process() delivers
+/// it once the encrypted channel is up.
 async fn resolve_listener_params(
     base: &GenericEsmtpListenerParams,
     my_address: &SocketAddr,
@@ -2695,35 +2696,18 @@ impl SmtpServerSession {
 
     async fn re_evaluate_listener_parameters(&mut self) -> anyhow::Result<()> {
         // re-evaluate parameters based on new IP info
-        self.params = Default::default();
-        self.params.apply_generic(
-            self.config_params.base.clone(),
+        let (params, rejection) = resolve_listener_params(
+            &self.config_params.base,
             &self.my_address,
             &self.peer_address,
             &mut self.meta,
-        );
-        match self
-            .call_callback::<GenericEsmtpListenerParams, _, _>(
-                "smtp_server_get_dynamic_parameters",
-                (self.my_address.to_string(), self.meta.clone()),
-            )
-            .await?
-        {
-            Ok(generic) => {
-                self.params.apply_generic(
-                    generic,
-                    &self.my_address,
-                    &self.peer_address,
-                    &mut self.meta,
-                );
-            }
-            Err(rej) => {
-                self.write_response(rej.code, rej.message, None, rej.disconnect)
-                    .await?;
-                return Ok(());
-            }
+        )
+        .await?;
+        self.params = params;
+        if let Some(rej) = rejection {
+            self.write_response(rej.code, rej.message, None, rej.disconnect)
+                .await?;
         }
-
         Ok(())
     }
 
