@@ -1229,12 +1229,26 @@ impl SmtpServerSession {
         // If smtp_server_get_dynamic_parameters rejects the connection, the rejection is held
         // here and delivered by process() once the encrypted channel is up to carry it.
         let mut deferred_rejection = None;
+        // Subscribed here so that the pre-handshake phase below can abandon the
+        // connection promptly on shutdown rather than waiting out client_timeout;
+        // later moved into the session, which needs it for the SMTP phase anyway.
+        let mut shutdown = ShutdownSubcription::get();
         if params.implicit_tls {
             // 1. If the listener also requires PROXY protocol, the cleartext PROXY header arrives
             //    ahead of the client's ClientHello. Consume it from the raw socket now (without
             //    over-reading into the ClientHello) and adopt the real addresses it advertises.
             if concrete_params.require_proxy_protocol {
-                match read_proxy_protocol_header(&mut socket, concrete_params.client_timeout).await {
+                let proxy_result = tokio::select! {
+                    _ = shutdown.shutting_down() => {
+                        tracing::debug!("shutting down while reading PROXY protocol header");
+                        return Ok(());
+                    }
+                    result = read_proxy_protocol_header(
+                        &mut socket,
+                        concrete_params.client_timeout,
+                    ) => result,
+                };
+                match proxy_result {
                     Ok((src, dst)) => {
                         if let Some(src) = src {
                             meta.set_meta("orig_received_from", peer_address.to_string());
@@ -1290,21 +1304,25 @@ impl SmtpServerSession {
         let (socket, tls_active): (BoxedAsyncReadAndWrite, Option<TlsInformation>) =
             if params.implicit_tls {
                 let acceptor = concrete_params.build_tls_acceptor().await?;
-                let stream = match tokio::time::timeout(
-                    concrete_params.client_timeout,
-                    acceptor.accept(socket),
-                )
-                .await
-                {
-                    Ok(Ok(stream)) => stream,
-                    Ok(Err(err)) => {
-                        tracing::debug!("TLS handshake failed: {err:#}");
+                let stream = tokio::select! {
+                    _ = shutdown.shutting_down() => {
+                        tracing::debug!("shutting down while awaiting TLS handshake");
                         return Ok(());
                     }
-                    Err(_) => {
-                        tracing::debug!("TLS handshake timeout");
-                        return Ok(());
-                    }
+                    result = tokio::time::timeout(
+                        concrete_params.client_timeout,
+                        acceptor.accept(socket),
+                    ) => match result {
+                        Ok(Ok(stream)) => stream,
+                        Ok(Err(err)) => {
+                            tracing::debug!("TLS handshake failed: {err:#}");
+                            return Ok(());
+                        }
+                        Err(_) => {
+                            tracing::debug!("TLS handshake timeout");
+                            return Ok(());
+                        }
+                    },
                 };
 
                 let (_io, conn) = stream.get_ref();
@@ -1336,7 +1354,7 @@ impl SmtpServerSession {
             tls_active,
             read_buffer: DebugabbleReadBuffer(Vec::with_capacity(1024)),
             params: concrete_params,
-            shutdown: ShutdownSubcription::get(),
+            shutdown,
             rcpt_count: 0,
             authorization_id: None,
             authentication_id: None,
