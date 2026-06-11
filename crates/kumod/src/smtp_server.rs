@@ -917,6 +917,10 @@ pub struct SmtpServerSession {
     session_id: Uuid,
     domains: HashMap<String, Option<EsmtpDomain>>,
     config_params: EsmtpListenerParams,
+    /// A rejection returned by smtp_server_get_dynamic_parameters when it ran
+    /// before the implicit TLS handshake, where there was no channel to report
+    /// it on; process() delivers it once the encrypted channel is up.
+    deferred_rejection: Option<RejectError>,
 }
 
 #[derive_where(Debug)]
@@ -1097,6 +1101,55 @@ async fn read_proxy_protocol_header(
     Ok((addr, dest_addr))
 }
 
+/// Invoke the `sig` callback, submitting Callback trace events keyed to `meta` and
+/// separating a lua-level rejection (`Ok(Err(..))`) from a hard error (`Err(..)`).
+///
+/// This is the core of [`SmtpServerSession::call_callback_sig`] as a free function,
+/// so that it can also be invoked before a [`SmtpServerSession`] exists.
+async fn call_callback_sig_with_meta<
+    R: FromLuaMulti + Default + serde::Serialize,
+    A: IntoLuaMulti + Clone,
+>(
+    sig: &CallbackSignature<A, R>,
+    args: A,
+    meta: &ConnectionMetaData,
+) -> anyhow::Result<Result<R, RejectError>> {
+    let mut config = load_config().await?;
+    let name = sig.name();
+    match config.async_call_callback(sig, args).await {
+        Ok(r) => {
+            config.put();
+            SmtpServerTraceManager::submit(|| SmtpServerTraceEvent {
+                conn_meta: meta.clone_inner(),
+                payload: SmtpServerTraceEventPayload::Callback {
+                    name: name.to_string(),
+                    result: serde_json::to_value(&r).ok(),
+                    error: None,
+                },
+                when: Utc::now(),
+            });
+
+            Ok(Ok(r))
+        }
+        Err(err) => {
+            SmtpServerTraceManager::submit(|| SmtpServerTraceEvent {
+                conn_meta: meta.clone_inner(),
+                payload: SmtpServerTraceEventPayload::Callback {
+                    name: name.to_string(),
+                    result: None,
+                    error: Some(format!("{err:#}")),
+                },
+                when: Utc::now(),
+            });
+            if let Some(rej) = RejectError::from_anyhow(&err) {
+                Ok(Err(rej))
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
 /// Fully resolve the listener parameters for a freshly accepted connection using the supplied
 /// addresses: start from the configured `base` (which applies any matching `peer`/`via`
 /// blocks) and then apply the overrides returned by the `smtp_server_get_dynamic_parameters`
@@ -1108,32 +1161,29 @@ async fn read_proxy_protocol_header(
 /// acceptor from fully-resolved parameters (per-source / per-destination certificates, client
 /// CAs, hostname) using the real client and destination addresses.
 ///
-/// A rejection returned by the event is intentionally ignored here: there is no SMTP channel
-/// to report it on before the TLS handshake. process() re-runs the event once the session is
-/// up and will reject there with a proper SMTP response.
+/// A rejection returned by the event cannot be reported yet (there is no SMTP channel before
+/// the TLS handshake), so it is returned alongside the resolved parameters; the caller stashes
+/// it on the session and process() delivers it once the encrypted channel is up. This is the
+/// one and only invocation of the event for an implicit-TLS session.
 async fn resolve_listener_params(
     base: &GenericEsmtpListenerParams,
     my_address: &SocketAddr,
     peer_address: &SocketAddr,
     meta: &mut ConnectionMetaData,
-) -> anyhow::Result<ConcreteEsmtpListenerParams> {
+) -> anyhow::Result<(ConcreteEsmtpListenerParams, Option<RejectError>)> {
     let mut params = ConcreteEsmtpListenerParams::default();
     params.apply_generic(base.clone(), my_address, peer_address, meta);
 
     let sig = CallbackSignature::<(String, ConnectionMetaData), GenericEsmtpListenerParams>::new(
         "smtp_server_get_dynamic_parameters",
     );
-    let mut config = load_config().await?;
-    let result = config
-        .async_call_callback(&sig, (my_address.to_string(), meta.clone()))
-        .await;
-    config.put();
-    match result {
-        Ok(generic) => params.apply_generic(generic, my_address, peer_address, meta),
-        Err(err) if RejectError::from_anyhow(&err).is_none() => return Err(err),
-        Err(_reject) => {}
+    match call_callback_sig_with_meta(&sig, (my_address.to_string(), meta.clone()), meta).await? {
+        Ok(generic) => {
+            params.apply_generic(generic, my_address, peer_address, meta);
+            Ok((params, None))
+        }
+        Err(rejection) => Ok((params, Some(rejection))),
     }
-    Ok(params)
 }
 
 impl SmtpServerSession {
@@ -1174,6 +1224,10 @@ impl SmtpServerSession {
         // STARTTLS/plain path gets this for free: it resolves parameters in process() (PROXY
         // header, then smtp_server_get_dynamic_parameters) before the STARTTLS command builds its
         // acceptor.
+        //
+        // If smtp_server_get_dynamic_parameters rejects the connection, the rejection is held
+        // here and delivered by process() once the encrypted channel is up to carry it.
+        let mut deferred_rejection = None;
         if params.implicit_tls {
             // 1. If the listener also requires PROXY protocol, the cleartext PROXY header arrives
             //    ahead of the client's ClientHello. Consume it from the raw socket now (without
@@ -1205,15 +1259,23 @@ impl SmtpServerSession {
             // 2. Re-resolve the listener parameters using the real (post-PROXY) addresses so that
             //    per-source / per-destination TLS certificates select correctly. The initial
             //    apply_generic above used the original socket addresses, which differ when proxied.
+            //    This is the only invocation of smtp_server_get_dynamic_parameters for the
+            //    session; process() skips the event for implicit-TLS sessions.
             match resolve_listener_params(&params.base, &my_address, &peer_address, &mut meta).await
             {
-                Ok(resolved) => concrete_params = resolved,
+                Ok((resolved, rejection)) => {
+                    concrete_params = resolved;
+                    deferred_rejection = rejection;
+                }
                 Err(err) => {
-                    // Proceed with the parameters resolved so far; process() re-resolves below and
-                    // will surface the error with a proper SMTP response once TLS is established.
+                    // Without fully-resolved parameters we could present the wrong certificate
+                    // for this peer; drop the connection (which the client will retry) rather
+                    // than fail the handshake confusingly.
                     tracing::error!(
-                        "error resolving listener parameters before implicit TLS handshake: {err:#}"
+                        "error resolving listener parameters before implicit TLS handshake, \
+                         closing connection: {err:#}"
                     );
+                    return Ok(());
                 }
             }
 
@@ -1285,6 +1347,7 @@ impl SmtpServerSession {
             session_id: Uuid::new_v4(),
             domains: HashMap::new(),
             config_params: params,
+            deferred_rejection,
         };
 
         if let Err(err) = server.process().await {
@@ -1763,40 +1826,7 @@ impl SmtpServerSession {
         sig: &CallbackSignature<A, R>,
         args: A,
     ) -> anyhow::Result<Result<R, RejectError>> {
-        let mut config = load_config().await?;
-        let name = sig.name();
-        match config.async_call_callback(sig, args).await {
-            Ok(r) => {
-                config.put();
-                SmtpServerTraceManager::submit(|| SmtpServerTraceEvent {
-                    conn_meta: self.meta.clone_inner(),
-                    payload: SmtpServerTraceEventPayload::Callback {
-                        name: name.to_string(),
-                        result: serde_json::to_value(&r).ok(),
-                        error: None,
-                    },
-                    when: Utc::now(),
-                });
-
-                Ok(Ok(r))
-            }
-            Err(err) => {
-                SmtpServerTraceManager::submit(|| SmtpServerTraceEvent {
-                    conn_meta: self.meta.clone_inner(),
-                    payload: SmtpServerTraceEventPayload::Callback {
-                        name: name.to_string(),
-                        result: None,
-                        error: Some(format!("{err:#}")),
-                    },
-                    when: Utc::now(),
-                });
-                if let Some(rej) = RejectError::from_anyhow(&err) {
-                    Ok(Err(rej))
-                } else {
-                    Err(err)
-                }
-            }
-        }
+        call_callback_sig_with_meta(sig, args, &self.meta).await
     }
 
     pub async fn call_callback<
@@ -1893,25 +1923,38 @@ impl SmtpServerSession {
             }
         }
 
-        match self
-            .call_callback::<GenericEsmtpListenerParams, _, _>(
-                "smtp_server_get_dynamic_parameters",
-                (self.my_address.to_string(), self.meta.clone()),
-            )
-            .await?
-        {
-            Ok(generic) => {
-                self.params.apply_generic(
-                    generic,
-                    &self.my_address,
-                    &self.peer_address,
-                    &mut self.meta,
-                );
-            }
-            Err(rej) => {
+        if self.config_params.implicit_tls {
+            // run() already resolved smtp_server_get_dynamic_parameters before
+            // the TLS handshake and self.params reflects its output; running the
+            // event again here would double any side effects it has. If it
+            // rejected the connection, the encrypted channel now exists to
+            // finally deliver that rejection.
+            if let Some(rej) = self.deferred_rejection.take() {
                 self.write_response(rej.code, rej.message, None, rej.disconnect)
                     .await?;
                 return Ok(());
+            }
+        } else {
+            match self
+                .call_callback::<GenericEsmtpListenerParams, _, _>(
+                    "smtp_server_get_dynamic_parameters",
+                    (self.my_address.to_string(), self.meta.clone()),
+                )
+                .await?
+            {
+                Ok(generic) => {
+                    self.params.apply_generic(
+                        generic,
+                        &self.my_address,
+                        &self.peer_address,
+                        &mut self.meta,
+                    );
+                }
+                Err(rej) => {
+                    self.write_response(rej.code, rej.message, None, rej.disconnect)
+                        .await?;
+                    return Ok(());
+                }
             }
         }
 

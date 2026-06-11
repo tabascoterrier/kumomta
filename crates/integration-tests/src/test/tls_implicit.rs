@@ -1,6 +1,7 @@
 use crate::kumod::{DaemonWithMaildirOptions, MailGenParams};
 use bstr::ByteSlice;
 use k9::assert_equal;
+use kumo_api_types::TraceSmtpV1Payload::Callback;
 use kumo_log_types::RecordType::{Delivery, Reception};
 use rfc5321::tokio_rustls::rustls::pki_types::ServerName;
 use rfc5321::{SmtpClient, SmtpClientTimeouts, TlsOptions};
@@ -51,6 +52,8 @@ async fn tls_implicit() -> anyhow::Result<()> {
         .start()
         .await?;
 
+    let tracer = daemon.trace_server().await?;
+
     // Connect to the source listener and wrap the socket in TLS before
     // sending any SMTP commands.
     let addr = daemon.source.listener("smtp");
@@ -76,6 +79,31 @@ async fn tls_implicit() -> anyhow::Result<()> {
             Duration::from_secs(50),
         )
         .await;
+
+    // The listener parameters (including smtp_server_get_dynamic_parameters)
+    // are resolved before the TLS handshake on an implicit_tls listener; the
+    // event must fire exactly once for the session, not again in the SMTP
+    // phase.
+    tracer
+        .wait_for(
+            |events| {
+                events.iter().any(|event| {
+                    matches!(&event.payload, Callback{name,..}
+                        if name == "smtp_server_get_dynamic_parameters")
+                })
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+    let trace_events = tracer.stop().await?;
+    let dynamic_params_calls = trace_events
+        .iter()
+        .filter(|event| {
+            matches!(&event.payload, Callback{name,..}
+                if name == "smtp_server_get_dynamic_parameters")
+        })
+        .count();
+    assert_equal!(dynamic_params_calls, 1);
 
     daemon.stop_both().await?;
 
@@ -163,6 +191,39 @@ async fn tls_implicit_proxy_protocol() -> anyhow::Result<()> {
     // proving the header was parsed and adopted ahead of the TLS handshake.
     let peer_address = reception.peer_address.as_ref().unwrap();
     assert_equal!(peer_address.addr.to_string(), "192.0.2.1");
+
+    Ok(())
+}
+
+/// Validate that a rejection raised by `smtp_server_get_dynamic_parameters` on an
+/// `implicit_tls = true` listener is delivered to the client. The event runs before
+/// the TLS handshake, when there is no channel to report a rejection on, so it is
+/// deferred and must arrive in place of the banner once the handshake completes.
+#[tokio::test]
+async fn tls_implicit_dynamic_params_reject() -> anyhow::Result<()> {
+    let mut daemon = DaemonWithMaildirOptions::new()
+        .env("KUMOD_SOURCE_IMPLICIT_TLS", "true")
+        .env("KUMOD_SOURCE_DYNAMIC_PARAMS_REJECT", "1")
+        .start()
+        .await?;
+
+    let addr = daemon.source.listener("smtp");
+    let mut client = connect_implicit_tls(addr, None).await?;
+
+    let connect_timeout = client.timeouts().connect_timeout;
+    let banner = client.read_response(None, connect_timeout).await?;
+    anyhow::ensure!(
+        banner.code == 421,
+        "expected the deferred rejection in place of the banner: {banner:#?}"
+    );
+    anyhow::ensure!(
+        banner
+            .content
+            .contains("rejected by smtp_server_get_dynamic_parameters"),
+        "unexpected rejection message: {banner:#?}"
+    );
+
+    daemon.stop_both().await?;
 
     Ok(())
 }

@@ -220,6 +220,12 @@ if WEBHOOK_PORT then
   end
 end
 
+if os.getenv 'KUMOD_SOURCE_DYNAMIC_PARAMS_REJECT' then
+  kumo.on('smtp_server_get_dynamic_parameters', function(listener, conn_meta)
+    kumo.reject(421, 'rejected by smtp_server_get_dynamic_parameters')
+  end)
+end
+
 kumo.on('get_listener_domain', function(domain, listener, conn_meta)
   if LISTENER_MAP then
     local map = kumo.json_parse(LISTENER_MAP)
